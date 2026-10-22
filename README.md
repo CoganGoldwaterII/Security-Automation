@@ -37,8 +37,6 @@ security-automation/
 
 Rollback scripts live alongside the remediation they reverse and are clearly identified in their filenames. Platform-specific scripts (Windows, Linux, macOS, or cloud/API) are grouped by language rather than a separate OS directory.
 
-*Git does not preserve empty directories. A `.gitkeep` file can hold each category until scripts are added.*
-
 ## Automation Model
 
 Many endpoint workflows follow this pattern:
