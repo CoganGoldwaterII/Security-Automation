@@ -1,60 +1,40 @@
 # ============================================================================
-# NAME: Detect ScreenConnect Presence
+# NAME: ScreenConnect Presence Evaluation
 # AUTHORED BY: Cogan Goldwater
 # TYPE: Evaluation
-# SCOPE: Windows endpoints / NinjaOne scheduled automation
-# VARIABLES:
-#   DetectionFieldName = screenconnectDetected
-#   ScanAllFixedDrivesForInstallerArtifacts = $false
+# SCOPE: Windows endpoints / NinjaOne automation (SYSTEM)
+# VARIABLES: None
 # OUTPUT TOKENS:
-#   YES | ScreenConnect findings detected
-#   NO  | No ScreenConnect findings detected
-#   NOTE: Final output is the bare YES or NO value.
+#   TRIGGER   | ScreenConnect evidence detected
+#   NO_ACTION | No ScreenConnect evidence detected in completed checks
+#   ERROR     | Evaluation or custom-field update incomplete
 # CUSTOM FIELDS:
 #   Reads: None
-#   Writes: screenconnectDetected (YES/NO)
-# FILE TRANSFERS:
-#   Required: No
-#   Files: None
-# LOGGING PATH:
-#   C:\MME\AutoLogs\ScreenConnect_Detect.log
+#   Writes: remoteSoftwarePresent (YES/NO on verified result only)
+# FILE TRANSFERS: None
+# LOGGING PATH: C:\MME\AutoLogs\ScreenConnect_Detect.log
 # DESCRIPTION:
-#   Evaluates ScreenConnect presence on Windows endpoints.
-#
-#   Detects:
-#     - Installed software uninstall registry entries
-#     - Services
-#     - Running processes
-#     - Scheduled tasks
-#     - Startup Run / RunOnce entries
-#     - Common leftover directories
-#     - Common EXE/MSI installer artifact locations
-#
-#   Searches machine-wide registry locations and loaded user hives.
-#   Installer artifact scanning uses common locations by default,
-#   with optional fixed-drive scanning controlled by configuration.
-#
-#   Writes YES or NO to the screenconnectDetected NinjaOne device
-#   custom field. This script does not update remediation fields.
-#
-#   Logs detection findings and non-fatal warnings.
-#   The paired remediation handles ScreenConnect removal.
-#   Always exits 0.
+#   Read-only check of installed software, services, running processes, tasks,
+#   startup entries, common directories, and EXE/MSI artifacts. Uses optional
+#   file-version metadata for renamed running executables. Does not interpret
+#   a failed collection or field write as a clean bill of health.
+#   Default file scan covers standard installation/user artifact locations;
+#   an arbitrary, nonrunning EXE elsewhere may require a full-drive scan.
 # ============================================================================
 
 # =========================
 # CONFIG
 # =========================
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$DetectionFieldName = "screenconnectDetected"
+$DetectionFieldName = "remoteSoftwarePresent"
 
 $LogRoot = "C:\MME\AutoLogs"
 $LogPath = Join-Path $LogRoot "ScreenConnect_Detect.log"
 
-$TargetRegex = '(?i)screenconnect'
+$TargetRegex = '(?i)screenconnect|connectwise[ ._-]*control'
 
 $ScanAllFixedDrivesForInstallerArtifacts = $false
 
@@ -70,8 +50,8 @@ $ArtifactExcludePathRegex = '(?i)\\Windows\\(WinSxS|servicing|System32|SysWOW64|
 # GLOBAL STATE
 # =========================
 
-$Findings = New-Object System.Collections.Generic.List[string]
-$Warnings = New-Object System.Collections.Generic.List[string]
+$Findings = New-Object -TypeName 'System.Collections.Generic.List[string]'
+$Warnings = New-Object -TypeName 'System.Collections.Generic.List[string]'
 
 
 # =========================
@@ -99,7 +79,6 @@ Custom Field Name: $DetectionFieldName
 "@
 
     $header | Out-File -FilePath $LogPath -Append -Encoding UTF8
-    Write-Host $header
 }
 
 function Write-Log {
@@ -122,10 +101,10 @@ function Write-Log {
         $line | Out-File -FilePath $LogPath -Append -Encoding UTF8
     }
     catch {
-        Write-Host "WARN | Failed writing to log file: $($_.Exception.Message)"
+        # Logging failures are reported by the final ERROR token where possible.
+        $script:LogFailed = $true
     }
 
-    Write-Host $line
 }
 
 function Add-Finding {
@@ -139,7 +118,9 @@ function Add-Finding {
         [string]$Message
     )
 
-    $script:Findings.Add($Message) | Out-Null
+    if (-not $script:Findings.Contains($Message)) {
+        $script:Findings.Add($Message) | Out-Null
+    }
     Write-Log "Finding: $Message"
 }
 
@@ -155,6 +136,7 @@ function Add-Warning {
     )
 
     $script:Warnings.Add($Message) | Out-Null
+    $script:ScanIncomplete = $true
     Write-Log -Level "WARN" -Message $Message
 }
 
@@ -176,13 +158,27 @@ function Test-IsTargetText {
     return ($Text -match $TargetRegex)
 }
 
+function Test-ExecutableIdentity {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+        $identity = @($info.ProductName, $info.FileDescription, $info.OriginalFilename,
+                      $info.CompanyName) -join ' '
+        return (Test-IsTargetText $identity)
+    }
+    catch { return $false }
+}
+
 function Get-UninstallRegistryEntries {
     <#
     DESCRIPTION:
         Enumerates machine-wide and loaded-user uninstall registry entries.
     #>
 
-    $paths = New-Object System.Collections.Generic.List[string]
+    $paths = New-Object -TypeName 'System.Collections.Generic.List[string]'
 
     $paths.Add("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*") | Out-Null
     $paths.Add("HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*") | Out-Null
@@ -201,7 +197,7 @@ function Get-UninstallRegistryEntries {
         Add-Warning "Failed to enumerate loaded user uninstall hives: $($_.Exception.Message)"
     }
 
-    $entries = New-Object System.Collections.Generic.List[object]
+    $entries = New-Object -TypeName 'System.Collections.Generic.List[object]'
 
     foreach ($path in $paths) {
         try {
@@ -264,7 +260,7 @@ function Test-Services {
     #>
 
     try {
-        $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        $services = @(Get-CimInstance Win32_Service -ErrorAction Stop |
             Where-Object {
                 $haystack = @($_.Name, $_.DisplayName, $_.PathName) -join " "
                 Test-IsTargetText $haystack
@@ -287,10 +283,11 @@ function Test-Processes {
     #>
 
     try {
-        $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop |
             Where-Object {
                 $haystack = @($_.Name, $_.ExecutablePath) -join " "
-                (Test-IsTargetText $haystack) -and ($_.ProcessId -ne $PID)
+                if ($_.ProcessId -eq $PID) { return $false }
+                (Test-IsTargetText $haystack) -or (Test-ExecutableIdentity $_.ExecutablePath)
             })
 
         foreach ($process in $processes) {
@@ -323,6 +320,8 @@ function Test-ScheduledTasks {
             catch {}
 
             $haystack = @($_.TaskName, $_.TaskPath, $actionText) -join " "
+            # An MME removal task does not itself establish that ScreenConnect is installed.
+            if ($_.TaskName -match '(?i)screenconnect.*remov') { return $false }
             Test-IsTargetText $haystack
         })
 
@@ -341,7 +340,7 @@ function Test-RunEntries {
         Detects Run and RunOnce registry startup entries referencing ScreenConnect.
     #>
 
-    $runPaths = New-Object System.Collections.Generic.List[string]
+    $runPaths = New-Object -TypeName 'System.Collections.Generic.List[string]'
 
     $runPaths.Add("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run") | Out-Null
     $runPaths.Add("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce") | Out-Null
@@ -403,7 +402,7 @@ function Get-CommonArtifactRoots {
         Builds common locations to check for ScreenConnect directories and installer artifacts.
     #>
 
-    $roots = New-Object System.Collections.Generic.List[string]
+    $roots = New-Object -TypeName 'System.Collections.Generic.List[string]'
 
     $possibleRoots = @(
         $env:ProgramFiles,
@@ -412,7 +411,9 @@ function Get-CommonArtifactRoots {
         "$env:SystemRoot\Temp",
         "$env:SystemDrive\Temp",
         "C:\MME",
-        "C:\MME\CS"
+        "C:\MME\CS",
+        "$env:PUBLIC\Downloads",
+        "$env:PUBLIC\Desktop"
     )
 
     foreach ($root in $possibleRoots) {
@@ -428,6 +429,8 @@ function Get-CommonArtifactRoots {
             $userRootCandidates = @(
                 "$($userDir.FullName)\Downloads",
                 "$($userDir.FullName)\Desktop",
+                "$($userDir.FullName)\OneDrive\Desktop",
+                "$($userDir.FullName)\OneDrive\Downloads",
                 "$($userDir.FullName)\AppData\Local",
                 "$($userDir.FullName)\AppData\Local\Temp",
                 "$($userDir.FullName)\AppData\Roaming"
@@ -535,6 +538,22 @@ function Test-InstallerArtifacts {
         }
     }
 
+    # Check drive roots for stand-alone EXE/MSI without expensive full-drive recursion.
+    try {
+        $fixedDrives = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 3" -ErrorAction Stop)
+        foreach ($drive in $fixedDrives) {
+            $root = "$($drive.DeviceID)\"
+            foreach ($pattern in $InstallerNamePatterns) {
+                foreach ($file in @(Get-ChildItem -Path (Join-Path $root $pattern) -File -Force -ErrorAction SilentlyContinue)) {
+                    if (Test-IsTargetText $file.Name) {
+                        $foundFiles[$file.FullName.ToLowerInvariant()] = $file.FullName
+                    }
+                }
+            }
+        }
+    }
+    catch { Add-Warning "Failed checking fixed-drive roots: $($_.Exception.Message)" }
+
     foreach ($filePath in $foundFiles.Values | Sort-Object -Unique) {
         Add-Finding "Installer artifact detected: $filePath"
     }
@@ -559,6 +578,7 @@ function Set-DetectionCustomField {
         }
 
         Ninja-Property-Set $DetectionFieldName $Value
+        $script:FieldWritten = $true
         Write-Log "Updated Ninja custom field '$DetectionFieldName' to '$Value'."
     }
     catch {
@@ -571,12 +591,15 @@ function Set-DetectionCustomField {
 # MAIN
 # =========================
 
-$DetectionValue = "NO"
+$ScanIncomplete = $false
+$FieldWritten = $false
+$LogFailed = $false
+$FinalToken = 'ERROR'
+$ResultDetail = 'EvaluationIncomplete'
 
 try {
     Initialize-Logging
-
-    Write-Log "Starting ScreenConnect detection."
+    Write-Log 'Starting ScreenConnect presence evaluation.'
 
     Test-UninstallEntries
     Test-Services
@@ -586,46 +609,42 @@ try {
     Test-Directories
     Test-InstallerArtifacts
 
+    foreach ($finding in $Findings) { Write-Log "Evidence: $finding" }
+    Write-Log "Findings=$($Findings.Count) Warnings=$($Warnings.Count)"
+
     if ($Findings.Count -gt 0) {
-        $DetectionValue = "YES"
+        # A positive finding stands even when another check was incomplete.
+        Set-DetectionCustomField -Value 'YES'
+        if ($FieldWritten) {
+            $FinalToken = 'TRIGGER'
+            $ResultDetail = 'ScreenConnectDetected'
+        }
+        else { $ResultDetail = 'FieldUpdateFailed' }
+    }
+    elseif ($ScanIncomplete) {
+        # Never overwrite a prior YES with NO when scan coverage was incomplete.
+        $ResultDetail = 'ScanIncomplete'
     }
     else {
-        $DetectionValue = "NO"
-    }
-
-    Write-Log "Detection result: $DetectionValue"
-    Write-Log "Finding count: $($Findings.Count)"
-    Write-Log "Warning count: $($Warnings.Count)"
-
-    if ($Findings.Count -gt 0) {
-        Write-Log "Findings summary:"
-        foreach ($finding in $Findings) {
-            Write-Log " - $finding"
+        Set-DetectionCustomField -Value 'NO'
+        if ($FieldWritten) {
+            $FinalToken = 'NO_ACTION'
+            $ResultDetail = 'ScreenConnectNotDetected'
         }
+        else { $ResultDetail = 'FieldUpdateFailed' }
     }
-
-    if ($Warnings.Count -gt 0) {
-        Write-Log "Warnings summary:"
-        foreach ($warning in $Warnings) {
-            Write-Log " - $warning" "WARN"
-        }
-    }
-
-    Set-DetectionCustomField -Value $DetectionValue
 }
 catch {
-    Add-Warning "Unexpected script error: $($_.Exception.Message)"
-
-    if ($Findings.Count -gt 0) {
-        $DetectionValue = "YES"
-    }
-    else {
-        $DetectionValue = "NO"
-    }
-
-    Set-DetectionCustomField -Value $DetectionValue
+    $ResultDetail = 'UnexpectedError'
+    try { Write-Log "Unexpected error: $($_.Exception.Message)" 'ERROR' } catch {}
 }
 finally {
-    Write-Host $DetectionValue
+    if ($LogFailed -and $FinalToken -eq 'NO_ACTION') {
+        # Local logging is operationally relevant but does not invalidate detection.
+        $ResultDetail = 'ScreenConnectNotDetected_LogWriteFailed'
+    }
+    Write-Host ("{0} | {1} Findings={2} Warnings={3} Field={4} Log={5}" -f `
+        $FinalToken, $ResultDetail, $Findings.Count, $Warnings.Count, `
+        $(if ($FieldWritten) { 'Updated' } else { 'NotUpdated' }), $LogPath)
     exit 0
 }
