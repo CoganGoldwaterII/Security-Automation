@@ -43,9 +43,9 @@ $ProgressPreference = 'SilentlyContinue'
 # ============================================================
 # CONFIGURATION / STATE
 # ============================================================
-$DesiredTemplateId = 'tmpl_ckGsxX3ycdqw8tuYEXbQqQl'
+$DesiredTemplateId = 'tmpl_YOUR_TEMPLATE_ID'
 $DesiredTemplateName = 'Third Party Remote Software Blocked -Template'
-$DesiredTemplateOwnerId = 'ACC-0120546'
+$DesiredTemplateOwnerId = 'ACC-YOUR_PROVIDER_ID'
 $OnePasswordVault = 'MME Automation'
 $WatchGuardItemName = 'WatchGuard'
 $BootstrapTokenField = 'opServiceAccountToken'
