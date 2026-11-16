@@ -1,13 +1,14 @@
-﻿# ============================================================================
+# ============================================================================
 # NAME: Device WatchGuard ProxyCA Evaluation
-# AUTHORED BY: MME Automation Playbook
+# AUTHORED BY: Cogan Goldwater
 # TYPE: Evaluation
 # SCOPE: Windows endpoint, device-level Ninja automation, runs as SYSTEM
 # VARIABLES: Required: None | Optional: None
 # OUTPUT TOKENS: TRIGGER / NO_ACTION / ERROR
 # CUSTOM FIELDS: Reads: None | Writes: None
 # LOGGING PATH: C:\MME\AutoLogs\WatchGuard_ProxyCA_Evaluation.log
-# DESCRIPTION: Read-only gateway ProxyCA validation and exact LocalMachine Root comparison.
+# DESCRIPTION: Read-only WatchGuard gateway ARP/OUI validation, ProxyCA validation,
+#              and exact LocalMachine Root comparison.
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -53,6 +54,18 @@ function Get-GatewayAddress {
     }
     $script:BestGatewayInterfaceIndex = [int]$candidates[0].IfIndex
     return [string]$candidates[0].Gateway
+}
+function Test-WatchGuardGatewayMac {
+    param([string]$Gateway)
+    $Neighbors = @(Get-NetNeighbor -IPAddress $Gateway -InterfaceIndex $script:BestGatewayInterfaceIndex -AddressFamily IPv4 -ErrorAction Stop)
+    if ($Neighbors.Count -ne 1) { throw 'Gateway ARP lookup did not return exactly one entry' }
+    $Neighbor = $Neighbors[0]
+    $Mac = (([string]$Neighbor.LinkLayerAddress) -replace '[-:]','').ToUpperInvariant()
+    if ($Mac -notmatch '^[0-9A-F]{12}$') { throw 'Gateway ARP entry has no usable MAC address' }
+    $IsWatchGuard = ($Mac.Substring(0,6) -in @('000121','00907F'))
+    if ([string]$Neighbor.IPAddress -ne $Gateway) { throw 'ARP entry does not match selected default gateway' }
+    Write-Log ('GATEWAY_ARP | Address={0} MAC={1} OUI={2} WatchGuard={3}' -f $Gateway,($Mac -replace '(.{2})(?!$)','$1-'),$Mac.Substring(0,6),$IsWatchGuard)
+    return $IsWatchGuard
 }
 function Get-GatewayProxyCA {
     param([string]$Gateway)
@@ -106,29 +119,36 @@ try {
     $Stage = 'Gateway'
     $Gateway = Get-GatewayAddress
     Write-Log ('GATEWAY | Address={0}' -f $Gateway)
-    $Stage = 'CertificateDownload'
-    $Certificate = Get-GatewayProxyCA -Gateway $Gateway
-    $Fingerprint = Get-Sha256Hex -Bytes $Certificate.RawData
-    $Thumbprint = $Certificate.Thumbprint
-    Write-Log ('SOURCE | Gateway={0} SHA256={1} Thumbprint={2}' -f $Gateway,$Fingerprint,$Thumbprint)
-    $Stage = 'CertificateValidity'
-    if ($Certificate.NotBefore.ToUniversalTime() -gt [datetime]::UtcNow -or
-        $Certificate.NotAfter.ToUniversalTime() -le [datetime]::UtcNow) {
-        throw 'Gateway CA certificate is outside its validity period'
-    }
-    $Stage = 'LocalRootCheck'
-    $Matched = $false
-    foreach ($Installed in @(Get-ChildItem -Path 'Cert:\LocalMachine\Root' -ErrorAction Stop)) {
-        if ((Get-Sha256Hex -Bytes $Installed.RawData) -ceq $Fingerprint) {
-            $Matched = $true
-            break
-        }
-    }
-    if ($Matched) {
-        $Final = 'NO_ACTION | Gateway={0} Thumbprint={1} CertificateAlreadyPresent' -f $Gateway,$Thumbprint
+    $Stage = 'GatewayARP'
+    $IsWatchGuardGateway = Test-WatchGuardGatewayMac -Gateway $Gateway
+    if (-not $IsWatchGuardGateway) {
+        $Final = 'NO_ACTION | Non-WatchGuard Gateway'
     }
     else {
-        $Final = 'TRIGGER | Gateway={0} Thumbprint={1} CertificateMissing' -f $Gateway,$Thumbprint
+        $Stage = 'CertificateDownload'
+        $Certificate = Get-GatewayProxyCA -Gateway $Gateway
+        $Fingerprint = Get-Sha256Hex -Bytes $Certificate.RawData
+        $Thumbprint = $Certificate.Thumbprint
+        Write-Log ('SOURCE | Gateway={0} SHA256={1} Thumbprint={2}' -f $Gateway,$Fingerprint,$Thumbprint)
+        $Stage = 'CertificateValidity'
+        if ($Certificate.NotBefore.ToUniversalTime() -gt [datetime]::UtcNow -or
+            $Certificate.NotAfter.ToUniversalTime() -le [datetime]::UtcNow) {
+            throw 'Gateway CA certificate is outside its validity period'
+        }
+        $Stage = 'LocalRootCheck'
+        $Matched = $false
+        foreach ($Installed in @(Get-ChildItem -Path 'Cert:\LocalMachine\Root' -ErrorAction Stop)) {
+            if ((Get-Sha256Hex -Bytes $Installed.RawData) -ceq $Fingerprint) {
+                $Matched = $true
+                break
+            }
+        }
+        if ($Matched) {
+            $Final = 'NO_ACTION | Gateway={0} Thumbprint={1} CertificateAlreadyPresent' -f $Gateway,$Thumbprint
+        }
+        else {
+            $Final = 'TRIGGER | Gateway={0} Thumbprint={1} CertificateMissing' -f $Gateway,$Thumbprint
+        }
     }
 }
 catch {
