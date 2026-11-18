@@ -2,13 +2,13 @@
 # NAME: MME IR Evidence RTR Audit
 # AUTHORED BY: Cogan Goldwater
 # TYPE: Manual IR Utility / Read-Only RTR Policy Audit
-# SCOPE: Analyst workstation / Windows / Device IR evidence ZIP
+# SCOPE: Analyst workstation / Windows / Device IR ZIP or Email IR ZIP/case folder
 # VARIABLES:
-#   Optional parameter: -EvidenceZip <full path to source Device IR ZIP>
-#   Default input/workspace: C:\MME\CS
+#   Optional parameter: -EvidenceZip <full path to Device IR ZIP, Email IR ZIP or EmailIR case folder>
+#   Default input/workspace: C:\MME\CS (audits every eligible source independently)
 # OUTPUT TOKENS:
-#   RESULT | RTR_AUDIT_COMPLETE | Source=<zip> Artifacts=<#> ReviewRequired=<#> Manifest=<path> Audit=<path>
-#   NO_ACTION | No eligible Device IR ZIP found in C:\MME\CS
+#   RESULT | RTR_AUDIT_COMPLETE | Source=<source> Artifacts=<#> ReviewRequired=<#> Manifest=<path> Audit=<path> NotPresent=<#>
+#   NO_ACTION | No eligible IR evidence ZIP or Email IR case folder found in C:\MME\CS
 #   ERROR | Stage=<stage> Error=<sanitized error>
 # CUSTOM FIELDS:
 #   Reads: None
@@ -16,8 +16,8 @@
 # LOGGING PATH:
 #   C:\MME\AutoLogs\MME_IR_Evidence_RTR_Audit.log
 # DESCRIPTION:
-#   Manual post-collection RTR policy audit for Device IR evidence. The source
-#   ZIP is never modified, overwritten, or deleted. The script fingerprints the
+#   Manual post-collection RTR policy audit for Device and Email IR evidence. The source
+#   ZIP or case folder is never modified, overwritten, or deleted. The script fingerprints the
 #   source before and after the audit, inventories every artifact, identifies
 #   artifact context, validates known binary signatures where practical, and
 #   assigns a deterministic RTR policy for Script B.
@@ -39,9 +39,14 @@
 #   Known opaque raw artifacts with safer corroborating evidence are assigned a
 #   deterministic REMOVE policy, including raw Prefetch, Jump Lists, SRUM, raw
 #   user/Amcache hives, recent-file shortcuts, and Chromium session/tab
-#   state. Unknown binary artifacts are REVIEW_REQUIRED. REVIEW_REQUIRED is therefore reserved for a genuine
-#   unresolved artifact decision, not a parser backlog.
+#   state. Unknown or invalid artifacts fail closed as ERROR rather than
+#   requiring an analyst to supply missing policy coverage.
 #
+#   Each eligible source produces its own manifest and audit result; a failure
+#   auditing one source does not prevent processing the others. Collector health,
+#   completeness and source-level collection issues are not assessed. NOT_PRESENT
+#   describes absence in the supplied bundle only; RTR errors are reserved for
+#   failures to read, classify, or safely process that bundle.
 #   Outputs are written to C:\MME\CS. Normal operational logging is written to
 #   C:\MME\AutoLogs. This script always exits 0.
 # ============================================================================
@@ -64,7 +69,7 @@ $LogDirectory  = 'C:\MME\AutoLogs'
 $LogPath       = Join-Path $LogDirectory 'MME_IR_Evidence_RTR_Audit.log'
 
 $PolicyVersion = '2.0'
-$ScriptBuild   = '2026.10.29-v5'
+$ScriptBuild   = '2026.11.18-v6.3-DualIR-multi-test'
 
 $CurrentStage = 'Initialize'
 $FinalOutput  = $null
@@ -73,6 +78,10 @@ $AuditPath    = $null
 $ManifestPath = $null
 $SourceHashBefore = $null
 $SourceHashAfter  = $null
+$SourceKind = $null
+$SourceEntries = New-Object 'System.Collections.Generic.List[object]'
+$PresenceItems = New-Object 'System.Collections.Generic.List[object]'
+$TotalSourceBytes = [long]0
 
 $Artifacts = New-Object 'System.Collections.Generic.List[object]'
 $ReviewItems = New-Object 'System.Collections.Generic.List[object]'
@@ -169,7 +178,7 @@ function Get-ZipEntryPrefix {
         return [byte[]]@()
     }
 
-    $Stream = $Entry.Open()
+    $Stream = Open-EvidenceStream -Entry $Entry
     try {
         $Count = [Math]::Min($Length,[int]$Entry.Length)
         $Buffer = New-Object byte[] $Count
@@ -186,6 +195,56 @@ function Get-ZipEntryPrefix {
     }
     finally {
         $Stream.Dispose()
+    }
+}
+
+# A case-directory file is represented as a source entry with SourceFile.
+# ZIP entries retain their original .Open() method.
+function Open-EvidenceStream {
+    param([Parameter(Mandatory)]$Entry)
+    if ($Entry.PSObject.Properties['SourceFile']) {
+        return [System.IO.File]::OpenRead([string]$Entry.SourceFile)
+    }
+    return $Entry.Open()
+}
+
+function Get-DirectoryFingerprint {
+    param([Parameter(Mandatory)][string]$Path)
+    $Root = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName.TrimEnd('\')
+    $Files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction Stop | Sort-Object FullName)
+    $Lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($File in $Files) {
+        if (($File.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Linked/reparse-point file is not allowed in evidence directory: $($File.FullName)"
+        }
+        $Rel = $File.FullName.Substring($Root.Length + 1).Replace('\','/')
+        $Lines.Add(('{0}|{1}|{2}' -f $Rel,$File.Length,(Get-Sha256File $File.FullName)))
+    }
+    $SHA = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($SHA.ComputeHash([Text.Encoding]::UTF8.GetBytes(($Lines -join "`n")))) -replace '-','').ToUpperInvariant()
+    }
+    finally { $SHA.Dispose() }
+}
+
+function Get-EvidencePresence {
+    # Inventory status, not a sixth RTR action. Absence does not imply that the
+    # incident had no such activity, only that this supplied bundle lacks it.
+    $Families = @(
+        @{ Name='Device_Windows_Event_Logs'; Pattern='(?i)\.evtx$' },
+        @{ Name='Device_WMI_Inventory'; Pattern='(?i)(?:^|\\)WMI(?:_|\\)' },
+        @{ Name='Device_Driver_Inventory'; Pattern='(?i)driver[s]?' },
+        @{ Name='Device_Browser_Artifacts'; Pattern='(?i)(?:^|\\)06_Browser_SaaS_Artifacts\\' },
+        @{ Name='Email_ExchangeAdmin'; Pattern='(?i)(?:^|\\)ExchangeAdmin\\' },
+        @{ Name='Email_ExchangeUser'; Pattern='(?i)(?:^|\\)ExchangeUser\\' },
+        @{ Name='Email_GraphAdmin'; Pattern='(?i)(?:^|\\)GraphAdmin\\' },
+        @{ Name='Email_GraphUser'; Pattern='(?i)(?:^|\\)GraphUser\\' },
+        @{ Name='Email_MIME'; Pattern='(?i)(?:^|\\)GraphUser\\MIME\\.*\.eml$' }
+    )
+    foreach ($Family in $Families) {
+        $Count = @($SourceEntries | Where-Object { $_.Path -match $Family.Pattern }).Count
+        $Status = if ($Count -gt 0) { 'PRESENT' } else { 'NOT_PRESENT' }
+        $PresenceItems.Add([pscustomobject][ordered]@{ ArtifactFamily=$Family.Name; Status=$Status; Count=$Count })
     }
 }
 
@@ -380,6 +439,46 @@ $PolicyCatalog['REMOVE_CHROMIUM_SESSION'] = [ordered]@{
     )
 }
 
+# Email MIME is an opaque container and may include mailbox bodies and
+# attachments. GraphUser/MailboxMessages.jsonl preserves metadata for RTR;
+# the raw MIME is not copied into the sanitized bundle.
+$PolicyCatalog['REMOVE_RAW_EMAIL_MIME'] = [ordered]@{
+    Handler = 'Remove'
+    Rules = @(
+        [ordered]@{ Selector='*'; Action='REMOVE'; RuleId='RAW_EMAIL_MIME'; DataClass='OPAQUE_MAIL_CONTENT' }
+    )
+}
+
+$PolicyCatalog['EMAIL_JSONL_RTR'] = [ordered]@{
+    Handler = 'JsonLinesContext'
+    Rules = @(
+        [ordered]@{ Selector='UTC timestamps, event/action identifiers, tenant/correlation/message IDs, IPs, device and security status'; Action='PRESERVE'; RuleId='EMAIL_JSONL_SECURITY_CONTEXT'; DataClass='SECURITY_EVIDENCE' },
+        [ordered]@{ Selector='Sender/recipient/reply-to/UPN/mailbox names, user display names, contacts and other human identities'; Action='TOKENIZE'; RuleId='EMAIL_JSONL_IDENTITY'; DataClass='IDENTITY' },
+        [ordered]@{ Selector='Subjects, email addresses, file names and identifiable path/URL components'; Action='TOKENIZE'; RuleId='EMAIL_JSONL_CONTEXT'; DataClass='IDENTITY_CONTEXT' },
+        [ordered]@{ Selector='Nested AuditData JSON strings and MIME-reference metadata'; Action='TOKENIZE'; RuleId='EMAIL_JSONL_NESTED_STRUCTURED_CONTEXT'; DataClass='STRUCTURED_DATA' },
+        [ordered]@{ Selector='Raw message bodies, body previews, attachment contents, passwords, session/OAuth/refresh/access tokens, secrets and recovery codes'; Action='REDACT'; RuleId='EMAIL_JSONL_PRIVATE_CONTENT'; DataClass='SECRET_OR_CONTENT' }
+    )
+}
+
+# Firefox SQLite artifacts already produced by the approved Device collector
+# must have a deterministic policy rather than a manual REVIEW_REQUIRED fallback.
+$PolicyCatalog['FIREFOX_SQLITE_RTR'] = [ordered]@{
+    Handler = 'FirefoxSqlite'
+    NativeRequirement = 'winsqlite3.dll'
+    Rules = @(
+        [ordered]@{ Selector='SQLite security metadata, row relationships and timestamps'; Action='PRESERVE'; RuleId='FIREFOX_SQLITE_SECURITY_CONTEXT'; DataClass='SECURITY_EVIDENCE' },
+        [ordered]@{ Selector='Visited URLs, page titles, form/search values, human names, email addresses and identity fields'; Action='TOKENIZE'; RuleId='FIREFOX_SQLITE_IDENTITY_CONTEXT'; DataClass='IDENTITY_CONTEXT' },
+        [ordered]@{ Selector='Cookie values, login/password material, auth/session tokens, payment and secret field values'; Action='REDACT'; RuleId='FIREFOX_SQLITE_SECRET_VALUES'; DataClass='SECRET' }
+    )
+}
+
+$PolicyCatalog['REMOVE_FIREFOX_OPAQUE_STORE'] = [ordered]@{
+    Handler = 'Remove'
+    Rules = @(
+        [ordered]@{ Selector='*'; Action='REMOVE'; RuleId='FIREFOX_OPAQUE_SECURITY_OR_SESSION_STORE'; DataClass='OPAQUE_BINARY' }
+    )
+}
+
 $PolicyCatalog['REVIEW_UNKNOWN_BINARY'] = [ordered]@{
     Handler = 'Review'
     Rules = @(
@@ -411,6 +510,15 @@ function Get-ArtifactDescriptor {
 
     if ($Entry.Length -eq 0) {
         return [pscustomobject]@{ Type='EmptyArtifact'; PolicyId='PRESERVE_SECURITY_ARTIFACT'; Validation='EMPTY' }
+    }
+
+    # Email IR evidence, emitted as directory files by emailIREvidenceCollector.
+    # The same rules apply if the analyst archives that case folder as ZIP.
+    if ($P -match '(?i)(?:^|\\)GraphUser\\MIME\\[^\\]+\.eml$') {
+        return [pscustomobject]@{ Type='RawEmailMime'; PolicyId='REMOVE_RAW_EMAIL_MIME'; Validation='EMAIL_COLLECTOR_MIME_PATH' }
+    }
+    if ($P -match '(?i)(?:^|\\)(ExchangeAdmin|ExchangeUser|GraphAdmin|GraphUser)\\' -and $Extension -eq '.jsonl') {
+        return [pscustomobject]@{ Type='EmailJsonLines'; PolicyId='EMAIL_JSONL_RTR'; Validation='EMAIL_COLLECTOR_JSONL' }
     }
 
     # Windows event logs.
@@ -528,11 +636,17 @@ function Get-ArtifactDescriptor {
         }
     }
 
-    # Firefox support is intentionally fail-closed until a complete policy is
-    # designed. This is a genuine review condition, not parser deferral.
+    # Firefox artifacts: structured databases get a defined native SQLite
+    # sanitizer route; cryptographic/session stores are removed as raw binaries.
     if ($P -match '(?i)(?:^|\\)06_Browser_SaaS_Artifacts\\Firefox\\Collected_Files\\') {
-        if ($LeafLower -in @('places.sqlite','formhistory.sqlite','cookies.sqlite','permissions.sqlite')) {
-            return [pscustomobject]@{ Type='FirefoxSQLite'; PolicyId='REVIEW_FIREFOX_SQLITE'; Validation='PATH_AND_NAME' }
+        if ($Extension -eq '.sqlite') {
+            if (-not (Test-ZipEntryAsciiPrefix -Entry $Entry -Expected "SQLite format 3`0")) {
+                throw "Firefox SQLite signature validation failed: $P"
+            }
+            return [pscustomobject]@{ Type='FirefoxSQLite'; PolicyId='FIREFOX_SQLITE_RTR'; Validation='SQLITE_SIGNATURE_OK' }
+        }
+        if ($LeafLower -in @('key4.db','cert9.db','sessionstore.jsonlz4') -or $P -match '(?i)\\sessionstore-backups\\') {
+            return [pscustomobject]@{ Type='FirefoxOpaqueStore'; PolicyId='REMOVE_FIREFOX_OPAQUE_STORE'; Validation='FIREFOX_PATH_AND_NAME' }
         }
         if ($LeafLower -eq 'logins.json') {
             return [pscustomobject]@{ Type='FirefoxLoginsJson'; PolicyId='GENERIC_STRUCTURED_RTR'; Validation='PATH_AND_NAME' }
@@ -646,16 +760,22 @@ function Get-PolicyUsageSummary {
 # SOURCE RESOLUTION
 # ============================================================
 
-function Resolve-EvidenceZip {
+function Resolve-EvidenceSources {
     param([AllowNull()][string]$RequestedPath)
 
     if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
         $Resolved = [Environment]::ExpandEnvironmentVariables($RequestedPath.Trim('"'))
+        if (Test-Path -LiteralPath $Resolved -PathType Container) {
+            if (-not (Test-Path -LiteralPath (Join-Path $Resolved 'Case.json') -PathType Leaf)) {
+                throw "Evidence directory is not an Email IR case: $Resolved"
+            }
+            return (Get-Item -LiteralPath $Resolved).FullName
+        }
         if (-not (Test-Path -LiteralPath $Resolved -PathType Leaf)) {
-            throw "Evidence ZIP not found: $Resolved"
+            throw "Evidence source not found: $Resolved"
         }
         if ([System.IO.Path]::GetExtension($Resolved) -ne '.zip') {
-            throw "Evidence source must be a .zip file: $Resolved"
+            throw "Evidence source must be a .zip file or Email IR case directory: $Resolved"
         }
         return (Get-Item -LiteralPath $Resolved).FullName
     }
@@ -667,17 +787,15 @@ function Resolve-EvidenceZip {
                 $_.Name -notmatch '(?i)_RTR_.*\.zip$'
             }
     )
-
-    if ($Candidates.Count -eq 0) {
-        return $null
-    }
-
-    if ($Candidates.Count -gt 1) {
-        $Names = ($Candidates.Name | Sort-Object) -join ', '
-        throw "Multiple eligible ZIP files found in $WorkspaceRoot. Specify -EvidenceZip. Files=$Names"
-    }
-
-    return $Candidates[0].FullName
+    $EmailCases = @(
+        Get-ChildItem -LiteralPath $WorkspaceRoot -Directory -Filter 'EmailIR_*' -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'Case.json') -PathType Leaf }
+    )
+    $Candidates = @($Candidates) + @($EmailCases)
+    if ($Candidates.Count -eq 0) { return }
+    # Return every eligible source, in deterministic order. The caller audits
+    # them independently, even if a different source fails.
+    return @($Candidates | Sort-Object FullName | ForEach-Object { $_.FullName })
 }
 
 # ============================================================
@@ -687,18 +805,66 @@ function Resolve-EvidenceZip {
 try {
     Initialize-Directory $WorkspaceRoot
     Initialize-Directory $LogDirectory
-
     Write-Log "START | MME IR Evidence RTR Audit | Build=$ScriptBuild Policy=$PolicyVersion"
+    $CurrentStage = 'ResolveEvidenceSources'
+    $EvidenceSources = @(Resolve-EvidenceSources -RequestedPath $EvidenceZip)
+}
+catch {
+    $FinalOutput = "ERROR | Stage=$CurrentStage Error=$(ConvertTo-SafeOutput $_.Exception.Message)"
+    Write-Log $FinalOutput
+    Write-Output $FinalOutput
+    exit 0
+}
 
-    $CurrentStage = 'ResolveEvidenceZip'
-    $EvidenceZip = Resolve-EvidenceZip -RequestedPath $EvidenceZip
+if ($EvidenceSources.Count -eq 0) {
+    $FinalOutput = "NO_ACTION | No eligible IR evidence ZIP or Email IR case folder found in $WorkspaceRoot"
+    Write-Log $FinalOutput
+    Write-Output $FinalOutput
+    exit 0
+}
 
-    if ([string]::IsNullOrWhiteSpace($EvidenceZip)) {
-        $FinalOutput = "NO_ACTION | No eligible Device IR ZIP found in $WorkspaceRoot"
-        Write-Log $FinalOutput
+# Preserve the original filenames for normal cases; prevent collisions if a
+# ZIP and a case folder happen to share the same stem.
+$StemCounts = @{}
+foreach ($SourcePath in $EvidenceSources) {
+    $Stem = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path -Path $SourcePath -Leaf))
+    if (-not $StemCounts.ContainsKey($Stem)) { $StemCounts[$Stem] = 0 }
+    $StemCounts[$Stem]++
+}
+
+foreach ($SourcePath in $EvidenceSources) {
+    # The v6 policy engine is unchanged. All transient state belongs to the
+    # current evidence bundle and must be reinitialized on each iteration.
+    $EvidenceZip = $SourcePath
+    $CurrentStage = 'InitializeSource'
+    $FinalOutput = $null
+    $ZipArchive = $null
+    $AuditPath = $null
+    $ManifestPath = $null
+    $SourceHashBefore = $null
+    $SourceHashAfter = $null
+    $SourceKind = $null
+    $SourceEntries = New-Object 'System.Collections.Generic.List[object]'
+        $PresenceItems = New-Object 'System.Collections.Generic.List[object]'
+                $TotalSourceBytes = [long]0
+    $Artifacts = New-Object 'System.Collections.Generic.List[object]'
+    $ReviewItems = New-Object 'System.Collections.Generic.List[object]'
+    $Stats = [ordered]@{
+        Artifacts = 0
+        PreserveRules = 0
+        TokenizeRules = 0
+        RedactRules = 0
+        RemoveRules = 0
+        ReviewRequired = 0
     }
-    else {
-        $SourceName = [System.IO.Path]::GetFileNameWithoutExtension($EvidenceZip)
+
+    try {
+        $SourceInfo = Get-Item -LiteralPath $EvidenceZip -ErrorAction Stop
+        $SourceKind = if ($SourceInfo.PSIsContainer) { 'DIRECTORY' } else { 'ZIP' }
+        $SourceName = [System.IO.Path]::GetFileNameWithoutExtension($SourceInfo.Name)
+        # Distinguish a case folder and ZIP sharing the same basename without
+        # altering existing names when they are unique.
+        if ($StemCounts[$SourceName] -gt 1) { $SourceName += '_' + $SourceKind }
         $ManifestPath = Join-Path $WorkspaceRoot ($SourceName + '_RTR_MANIFEST.json')
         $AuditPath    = Join-Path $WorkspaceRoot ($SourceName + '_RTR_AUDIT.log')
 
@@ -706,30 +872,60 @@ try {
         Remove-Item -LiteralPath $AuditPath -Force -ErrorAction SilentlyContinue
 
         $CurrentStage = 'FingerprintSourceBefore'
-        $SourceHashBefore = Get-Sha256File $EvidenceZip
-        $SourceInfo = Get-Item -LiteralPath $EvidenceZip
+        if ($SourceKind -eq 'ZIP') { $SourceHashBefore = Get-Sha256File $EvidenceZip }
+        else { $SourceHashBefore = Get-DirectoryFingerprint $EvidenceZip }
 
-        Write-Audit 'MME DEVICE IR RTR POLICY AUDIT'
+        $CurrentStage = 'OpenEvidence'
+        if ($SourceKind -eq 'ZIP') {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $ZipArchive = [System.IO.Compression.ZipFile]::OpenRead($EvidenceZip)
+            foreach ($Entry in $ZipArchive.Entries) {
+                $RawName = [string]$Entry.FullName
+                if ($RawName.EndsWith('/') -or $RawName.EndsWith('\\')) { continue }
+                $SourceEntries.Add([pscustomobject]@{
+                    Path=(Normalize-ZipPath $RawName); Entry=$Entry
+                })
+            }
+        }
+        else {
+            $Root = $SourceInfo.FullName.TrimEnd('\')
+            foreach ($File in @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction Stop)) {
+                if (($File.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Reparse-point evidence file is not allowed: $($File.FullName)"
+                }
+                $Rel = $File.FullName.Substring($Root.Length + 1).Replace('/','\')
+                $FileEntry = [pscustomobject]@{
+                    Length=[long]$File.Length
+                    CompressedLength=[long]$File.Length
+                    SourceFile=$File.FullName
+                }
+                $SourceEntries.Add([pscustomobject]@{ Path=$Rel; Entry=$FileEntry })
+            }
+        }
+        if ($SourceEntries.Count -eq 0) { throw 'No evidence artifacts found in source.' }
+        $UniquePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($Item in $SourceEntries) {
+            $TotalSourceBytes += [long]$Item.Entry.Length
+            if (-not $UniquePaths.Add($Item.Path)) { throw "Duplicate evidence archive path: $($Item.Path)" }
+            if ($Item.Path -match '(^|\\)\.\.(\\|$)') { throw "Invalid evidence entry traversal path: $($Item.Path)" }
+        }
+
+        Write-Audit 'MME DEVICE / EMAIL IR RTR POLICY AUDIT'
         Write-Audit ("Build={0} | Policy={1}" -f $ScriptBuild,$PolicyVersion)
-        Write-Audit ("Source={0}" -f $EvidenceZip)
+        Write-Audit ("Source={0} | Type={1}" -f $EvidenceZip,$SourceKind)
         Write-Audit ("SourceSHA256={0}" -f $SourceHashBefore)
         Write-Audit 'NOTE | Script A assigns deterministic RTR policies. Script B performs value-level RTR and writes the detailed final change log.'
         Write-Audit '----------------------------------------------------------------------------'
-
-        Write-Log "SOURCE | File=$($SourceInfo.Name) Size=$($SourceInfo.Length) SHA256=$SourceHashBefore"
-
-        $CurrentStage = 'OpenZip'
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $ZipArchive = [System.IO.Compression.ZipFile]::OpenRead($EvidenceZip)
-
+        Write-Log "SOURCE | File=$($SourceInfo.Name) Type=$SourceKind SHA256=$SourceHashBefore"
         $CurrentStage = 'ClassifyArtifacts'
-        foreach ($Entry in $ZipArchive.Entries) {
-            $RawName = [string]$Entry.FullName
-            if ($RawName.EndsWith('/') -or $RawName.EndsWith('\')) { continue }
-
-            $Path = Normalize-ZipPath $RawName
+        foreach ($Item in $SourceEntries) {
+            $Path = $Item.Path
+            $Entry = $Item.Entry
             $Descriptor = Get-ArtifactDescriptor -Path $Path -Entry $Entry
-
+            if ($Descriptor.Validation -match '_FAILED$' -or
+                $Descriptor.PolicyId -in @('REVIEW_UNKNOWN_BINARY','REVIEW_FIREFOX_SQLITE')) {
+                throw "Artifact classification/validation error: $Path Validation=$($Descriptor.Validation)"
+            }
             Add-ArtifactRecord `
                 -Path $Path `
                 -ArtifactType $Descriptor.Type `
@@ -738,7 +934,12 @@ try {
                 -Length $Entry.Length `
                 -CompressedLength $Entry.CompressedLength
         }
-
+        Get-EvidencePresence
+        foreach ($Presence in $PresenceItems) {
+            if ($Presence.Status -eq 'NOT_PRESENT') {
+                Write-Audit ('NOT_PRESENT | Family={0}' -f $Presence.ArtifactFamily)
+            }
+        }
         $CurrentStage = 'BuildManifest'
         $PolicyUsage = @(Get-PolicyUsageSummary)
 
@@ -757,8 +958,9 @@ try {
             Source = [ordered]@{
                 FileName = [System.IO.Path]::GetFileName($EvidenceZip)
                 FullPath = $EvidenceZip
-                Length   = $SourceInfo.Length
+                Length   = $(if ($SourceKind -eq 'ZIP') { [long]$SourceInfo.Length } else { $TotalSourceBytes })
                 SHA256   = $SourceHashBefore
+                InputType = $SourceKind
             }
             ApprovedActions = @('PRESERVE','TOKENIZE','REDACT','REMOVE','REVIEW_REQUIRED')
             ExecutionRules = [ordered]@{
@@ -773,11 +975,13 @@ try {
                 Artifacts = $Stats.Artifacts
                 ReviewRequired = $ReviewItems.Count
                 PoliciesUsed = $UsedPolicyIds.Count
+                NotPresent = @($PresenceItems | Where-Object { $_.Status -eq 'NOT_PRESENT' }).Count
             }
             PolicyUsage = @($PolicyUsage)
             Policies = $UsedPolicies
             Artifacts = $Artifacts.ToArray()
             ReviewItems = $ReviewItems.ToArray()
+            ArtifactPresence = $PresenceItems.ToArray()
         }
 
         $CurrentStage = 'SerializeManifest'
@@ -824,7 +1028,8 @@ try {
             $ZipArchive = $null
         }
 
-        $SourceHashAfter = Get-Sha256File $EvidenceZip
+        if ($SourceKind -eq 'ZIP') { $SourceHashAfter = Get-Sha256File $EvidenceZip }
+        else { $SourceHashAfter = Get-DirectoryFingerprint $EvidenceZip }
         if ($SourceHashAfter -ne $SourceHashBefore) {
             throw "Source evidence hash changed during audit. Before=$SourceHashBefore After=$SourceHashAfter"
         }
@@ -833,39 +1038,34 @@ try {
         Write-Log "SOURCE_INTEGRITY | PASS | SHA256=$SourceHashAfter"
 
         $FinalOutput = (
-            'RESULT | RTR_AUDIT_COMPLETE | Source={0} Artifacts={1} ReviewRequired={2} Manifest={3} Audit={4}' -f
+            'RESULT | RTR_AUDIT_COMPLETE | Source={0} Artifacts={1} ReviewRequired={2} Manifest={3} Audit={4} NotPresent={5}' -f
             ([System.IO.Path]::GetFileName($EvidenceZip)),
             $Stats.Artifacts,
             $ReviewItems.Count,
             $ManifestPath,
-            $AuditPath
+            $AuditPath,
+            @($PresenceItems | Where-Object { $_.Status -eq 'NOT_PRESENT' }).Count
         )
 
         Write-Log $FinalOutput
     }
-}
-catch {
-    $SafeError = ConvertTo-SafeOutput $_.Exception.Message
-    $FinalOutput = "ERROR | Stage=$CurrentStage Error=$SafeError"
-    Write-Log $FinalOutput
-
-    if (-not [string]::IsNullOrWhiteSpace($AuditPath)) {
-        try {
-            Write-Audit ("ERROR | Stage={0} | Error={1}" -f $CurrentStage,$SafeError)
-        }
-        catch {
+    catch {
+        $SafeError = ConvertTo-SafeOutput $_.Exception.Message
+        $FinalOutput = "ERROR | Stage=$CurrentStage Source=$([System.IO.Path]::GetFileName($EvidenceZip)) Error=$SafeError"
+        Write-Log $FinalOutput
+        if (-not [string]::IsNullOrWhiteSpace($AuditPath)) {
+            try { Write-Audit ("ERROR | Stage={0} | Error={1}" -f $CurrentStage,$SafeError) }
+            catch { }
         }
     }
-}
-finally {
-    if ($null -ne $ZipArchive) {
-        try { $ZipArchive.Dispose() } catch {}
+    finally {
+        if ($null -ne $ZipArchive) {
+            try { $ZipArchive.Dispose() } catch { }
+        }
+        if ([string]::IsNullOrWhiteSpace($FinalOutput)) {
+            $FinalOutput = "ERROR | Stage=Finalize Source=$([System.IO.Path]::GetFileName($EvidenceZip)) Error=No final result was produced."
+        }
+        Write-Output $FinalOutput
     }
-
-    if ([string]::IsNullOrWhiteSpace($FinalOutput)) {
-        $FinalOutput = 'ERROR | Stage=Finalize Error=No final result was produced.'
-    }
-
-    Write-Output $FinalOutput
-    exit 0
 }
+exit 0
