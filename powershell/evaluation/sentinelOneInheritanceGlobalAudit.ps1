@@ -15,9 +15,9 @@
 # OUTPUT:   TRIGGER | NO_ACTION | ERROR (exit code always 0)
 #
 # Identifies eligible Sites requiring a reversion attempt, and records
-# GroupTargets whose inherited state is not already TRUE. As in our pilot,
-# an absent Site inheritance property is treated as needing a reversion
-# attempt; the remediation will check current state before any PUT.
+# GroupTargets whose inherited state is not already TRUE. For sites where
+# the Sites list omits inheritance, GET the individual site to check again.
+# If neither response exposes inherits, retain UNKNOWN as before.
 # Sites with Site inheritance TRUE and all eligible Groups already inheriting
 # are omitted from the target set. Protected groups/sites never targeted.
 # Does not call any policy-changing endpoint.
@@ -285,6 +285,20 @@ try {
         }
 
         $siteStatus = Get-InheritanceLabel -Record $site
+        if ($siteStatus -eq 'UNKNOWN') {
+            # The Sites list may omit inherits. Check the individual Site record.
+            $Stage = "GetSiteInheritance:$siteId"
+            $detailResponse = Invoke-S1 -Path "/web/api/v2.1/sites/$([uri]::EscapeDataString($siteId))"
+            if ($null -eq $detailResponse -or $null -eq $detailResponse.data) {
+                throw "Site detail response missing data for SiteId=$siteId"
+            }
+            $detailSite = $detailResponse.data
+            if ([string]$detailSite.id -ne $siteId -or [string]$detailSite.accountId -ne $AccountId) {
+                throw "Site detail identity/account mismatch for SiteId=$siteId"
+            }
+            $siteStatus = Get-InheritanceLabel -Record $detailSite
+            Write-Log "SITE_INHERITANCE_DETAIL | Site=$siteName SiteId=$siteId Inheritance=$siteStatus"
+        }
         if ($siteStatus -eq 'FALSE') { $siteKnownBroken++ }
         if ($siteStatus -eq 'UNKNOWN') { $siteUnknown++ }
         if ($siteStatus -eq 'TRUE' -and $targets.Count -eq 0) {
