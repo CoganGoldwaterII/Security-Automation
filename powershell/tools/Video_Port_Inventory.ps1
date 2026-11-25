@@ -8,17 +8,16 @@
 # CUSTOM FIELDS: videoPorts (Text by default; Multi-line optional; read/write)
 # LOGGING PATH: C:\MME\AutoLogs\Video_Port_Inventory.log
 # DESCRIPTION: Count active Windows display connections by output technology.
-#              Inventory local firmware, AMD board layouts and NVIDIA
-#              driver outputs on conventional desktops. NVIDIA output counts
-#              and supplemental logical VGA are labeled Inferred. Failed or
-#              unsupported adapter sources preserve usable counts as Partial.
-#              N/A if no usable baseline or active reconciliation is unavailable;
-#              active physical-type counts exceeding baseline are labeled
-#              Unverified. These are not verified or additive socket counts.
-#              A failed or negative supplemental query retains baseline counts.
-#              Firmware ownership is assumed for this limited topology.
-#              Overwrite and verify videoPorts. No monitor details, vendor
-#              lookups, downloads, display changes or ledger changes.
+#              Inventory firmware, AMD board layouts and NVIDIA VBIOS DCB
+#              connector records on supported desktops. Count each board once.
+#              Never count NVIDIA logical output IDs or Windows display targets
+#              as physical sockets. Reject ambiguous DCB tables; preserve known
+#              board-reported counts as Partial when a source is unavailable.
+#              Cross-check connected target/base types without adding sockets.
+#              Unresolved discrepancies flagged Check. Firmware ownership and
+#              completeness are not guaranteed. VBT/ACPI evidence is log-only.
+#              Overwrite and verify videoPorts. No downloads, external lookups,
+#              display changes or ledger changes. Physically validate all results!
 # ============================================================================
 
 [CmdletBinding()]
@@ -26,7 +25,8 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptBuild = '2026.11.25-v11'
+$ScriptBuild = '2026.11.25-v15'
+$Disclaimer = 'Physically validate all results!'
 $LogFile = 'C:\MME\AutoLogs\Video_Port_Inventory.log'
 $Field = 'videoPorts'
 # Keep false for existing Text field; true only for a Multi-line field.
@@ -76,6 +76,233 @@ function Get-DisplayType {
     }
 }
 
+# Read-only board topology probes. Never treat these records as verified sockets.
+function Write-EvidenceBlob {
+    param([string]$Name,[byte[]]$Bytes)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    $ms=New-Object IO.MemoryStream
+    try {
+        $hash=[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','')
+        if ($script:EvidenceHashes.ContainsKey($hash)) { Write-Log INFO "Evidence duplicate: $Name; SHA256=$hash"; return }
+        $gz=[IO.Compression.GZipStream]::new($ms,[IO.Compression.CompressionMode]::Compress,$true)
+        try { $gz.Write($Bytes,0,$Bytes.Length) } finally { $gz.Dispose() }
+        $encoded=[Convert]::ToBase64String($ms.ToArray())
+        if ($script:EvidenceChars+$encoded.Length -gt 1500000) { Write-Log WARN "Evidence budget exceeded: $Name"; return }
+        $script:EvidenceHashes[$hash]=$true
+        $script:EvidenceChars+=$encoded.Length
+        $parts=[int][Math]::Ceiling($encoded.Length/2048.0)
+        Write-Log INFO "Evidence Name=$Name; SHA256=$hash; Bytes=$($Bytes.Length); Encoding=GzipBase64; Parts=$parts"
+        for ($i=0;$i -lt $parts;$i++) {
+            $offset=$i*2048; $chunk=$encoded.Substring($offset,[Math]::Min(2048,$encoded.Length-$offset))
+            Write-Log INFO "EVIDENCE SHA256=$hash; Part=$($i+1)/$parts; Data=$chunk"
+        }
+    } finally { $sha.Dispose(); $ms.Dispose() }
+}
+function Read-IntelVbtEvidence {
+    param([byte[]]$Bytes,[string]$Source)
+    # VBT header and BDB general definitions; child devices describe routing.
+    if ($Bytes.Length -lt 48) { return }
+    $ascii=[Text.Encoding]::ASCII.GetString($Bytes); $start=0; $found=0
+    while ($start -lt $ascii.Length) {
+        $p=$ascii.IndexOf('$VBT',$start,[StringComparison]::Ordinal)
+        if ($p -lt 0) { break }; $start=$p+4
+        if ($p+48 -gt $Bytes.Length) { continue }
+        $header=[BitConverter]::ToUInt16($Bytes,$p+22); $size=[BitConverter]::ToUInt16($Bytes,$p+24)
+        $rel=[BitConverter]::ToUInt32($Bytes,$p+28)
+        if ($header -lt 48 -or $size -lt $header -or $p+$size -gt $Bytes.Length -or $rel -lt $header -or $rel+22 -gt $size) { continue }
+        $bdb=$p+[int]$rel
+        if ($ascii.Substring($bdb,15) -cne 'BIOS_DATA_BLOCK') { continue }
+        $ver=[BitConverter]::ToUInt16($Bytes,$bdb+16); $bh=[BitConverter]::ToUInt16($Bytes,$bdb+18); $bs=[BitConverter]::ToUInt16($Bytes,$bdb+20)
+        if ($bh -lt 22 -or $bs -lt $bh -or $rel+$bs -gt $size) { continue }
+        $found++; $script:VbtFound++
+        $vbt=New-Object byte[] $size; [Array]::Copy($Bytes,$p,$vbt,0,$size)
+        $sum=0; foreach ($b in $vbt) { $sum=($sum+[int]$b) -band 255 }
+        Write-Log INFO "Intel VBT Source=$Source; Offset=$p; Size=$size; BDBVersion=$ver; ChecksumRemainder=$sum; candidate topology only"
+        Write-EvidenceBlob -Name "IntelVBT:$Source" -Bytes $vbt
+        $pos=$bdb+$bh; $end=$bdb+$bs
+        while ($pos+3 -le $end) {
+            $block=[int]$Bytes[$pos]; $len=[int][BitConverter]::ToUInt16($Bytes,$pos+1); $data=$pos+3
+            if ($data+$len -gt $end) { Write-Log WARN 'VBT block out of bounds.'; break }
+            if ($block -eq 2) {
+                if ($len -lt 5) { Write-Log WARN 'VBT general definitions truncated.'; break }
+                $stride=[int]$Bytes[$data+4]
+                if ($stride -lt 4 -or ($len-5)%$stride -ne 0) { Write-Log WARN "VBT child record size unresolved: $stride"; break }
+                $n=[int](($len-5)/$stride)
+                for ($j=0;$j -lt $n;$j++) {
+                    $e=$data+5+$j*$stride; $handle=[BitConverter]::ToUInt16($Bytes,$e); $type=[BitConverter]::ToUInt16($Bytes,$e+2)
+                    if ($type -eq 0) { continue }
+                    $dvo='Unknown'; if ($stride -ge 17 -and $ver -ge 155) { $dvo=[string]$Bytes[$e+16] }
+                    Write-Log INFO ("Intel VBT child Index={0}; Handle=0x{1:X4}; DeviceType=0x{2:X4}; DvoPort={3}; AnalogFlag={4}; DPFlag={5}; TMDSFlag={6}; Raw={7}" -f $j,$handle,$type,$dvo,[bool]($type -band 1),[bool]($type -band 4),[bool]($type -band 16),[BitConverter]::ToString($Bytes,$e,$stride))
+                }
+                break
+            }
+            if ($block -eq 53) { Write-Log WARN 'VBT variable MIPI block encountered; no further decoding.'; break }
+            $pos=$data+$len
+        }
+        if ($found -ge 8) { break }
+    }
+}
+function Read-NvidiaDcbEvidence {
+    param([byte[]]$Bytes,[string]$Source,[string]$InstanceId)
+    # NVIDIA DCB 4.x public spec: legacy ROM, device entries and connector table.
+    # Accept only a matching adapter cache and ordinary add-in card layouts.
+    # One connector-table index, not one display path, is one board candidate.
+    if ($Bytes.Length -lt 64 -or $Bytes[0] -ne 0x55 -or $Bytes[1] -ne 0xaa) { throw 'No supported PCI ROM header.' }
+    $pcir=[int][BitConverter]::ToUInt16($Bytes,0x18)
+    if ($pcir -lt 0x1a -or $pcir+0x18 -gt $Bytes.Length -or [Text.Encoding]::ASCII.GetString($Bytes,$pcir,4) -cne 'PCIR') { throw 'Invalid PCI ROM data header.' }
+    if ($InstanceId -notmatch '(?i)VEN_10DE&DEV_([0-9A-F]{4})') { throw 'NVIDIA device ID unavailable.' }
+    $expected=[Convert]::ToUInt16($Matches[1],16)
+    if ([BitConverter]::ToUInt16($Bytes,$pcir+4) -ne 0x10de -or [BitConverter]::ToUInt16($Bytes,$pcir+6) -ne $expected) { throw 'Cached ROM does not match adapter PCI ID.' }
+    $size=[int][BitConverter]::ToUInt16($Bytes,$pcir+0x10)*512
+    if ($size -lt 64 -or $size -gt $Bytes.Length -or $pcir+0x18 -gt $size -or $Bytes[$pcir+0x14] -ne 0) { throw 'Unsupported/truncated legacy ROM image.' }
+    # PCI legacy ROM checksum. A failed check never contributes socket counts.
+    $sum=0; for ($i=0;$i -lt $size;$i++) { $sum=($sum+[int]$Bytes[$i]) -band 255 }
+    if ($sum -ne 0) { throw 'Cached legacy ROM checksum failed.' }
+    $dcb=[int][BitConverter]::ToUInt16($Bytes,0x36)
+    if ($dcb -lt 0x38 -or $dcb+23 -gt $size -or $Bytes[$dcb] -lt 0x40 -or $Bytes[$dcb] -ge 0x50 -or [BitConverter]::ToUInt32($Bytes,$dcb+6) -ne 0x4edcbdcb) { throw 'Supported DCB 4.x signature unavailable.' }
+    $dh=[int]$Bytes[$dcb+1]; $dn=[int]$Bytes[$dcb+2]; $ds=[int]$Bytes[$dcb+3]
+    if ($dh -lt 23 -or $ds -ne 8 -or $dn -lt 1 -or $dn -gt 64 -or $dcb+$dh+$dn*$ds -gt $size) { throw 'Invalid DCB device table.' }
+    $conn=[int][BitConverter]::ToUInt16($Bytes,$dcb+0x14)
+    if ($conn -lt 0x38 -or $conn+5 -gt $size) { throw 'Invalid connector table pointer.' }
+    $ver=[int]$Bytes[$conn]; $hdr=[int]$Bytes[$conn+1]; $n=[int]$Bytes[$conn+2]; $stride=[int]$Bytes[$conn+3]
+    if ($ver -ne 0x40 -or $hdr -lt 5 -or $stride -ne 4 -or $n -lt 1 -or $n -gt 16 -or $conn+$hdr+$n*$stride -gt $size) { throw 'Malformed/unsupported connector table.' }
+    $platform=[int]$Bytes[$conn+4]
+    if ($platform -notin @(0,1)) { throw 'Nonstandard/configurable NVIDIA board layout.' }
+    $referenced=@{}
+    for ($i=0;$i -lt $dn;$i++) {
+        $path=[BitConverter]::ToUInt32($Bytes,$dcb+$dh+$i*$ds)
+        $kind=$path -band 15
+        if ($kind -eq 14) { break }
+        if ($kind -eq 15 -or ($path -band 0x10000000) -ne 0) { continue }
+        if ($kind -notin @(0,1,2,3,5,6)) { throw "Unknown DCB display path type $kind" }
+        $index=($path -shr 12) -band 15
+        if ($index -ge $n) { throw 'DCB display path refers outside connector table.' }
+        $referenced[[int]$index]=$true
+    }
+    $counts=@{}; $locations=@{}; $unresolved=$false
+    Write-Log INFO ("NVIDIA DCB Source={0}; Adapter={1}; Version=0x{2:X2}; Platform=0x{3:X2}; Entries={4}" -f $Source,$InstanceId,$ver,$platform,$n)
+    for ($i=0;$i -lt $n;$i++) {
+        $e=$conn+$hdr+$i*$stride; $code=[int]$Bytes[$e]; $loc=[int]$Bytes[$e+1] -band 15
+        # Maintain existing family labels (mini-DP grouped with DP).
+        $type=switch ($code) { 0x00 {'VGA'} 0x01 {'DVI'} 0x30 {'DVI'} 0x31 {'DVI'} 0x46 {'DP'} 0x48 {'DP'} 0x61 {'HDMI'} 0x63 {'HDMI'} 0xFF {'Skip'} 0x70 {'Virtual'} default {'Unknown'} }
+        Write-Log INFO ("NVIDIA DCB connector Index={0}; Code=0x{1:X2}; Location={2}; Type={3}; Referenced={4}; Raw={5}" -f $i,$code,$loc,$type,$referenced.ContainsKey($i),[BitConverter]::ToString($Bytes,$e,$stride))
+        if ($type -in @('Skip','Virtual')) { if ($referenced.ContainsKey($i)) { $unresolved=$true }; continue }
+        # Unreferenced entries and colliding bracket locations cannot establish
+        # unique installed sockets. Reject the board rather than guess.
+        if ($type -eq 'Unknown' -or -not $referenced.ContainsKey($i) -or $locations.ContainsKey($loc)) { $unresolved=$true; continue }
+        $locations[$loc]=$true
+        if (-not $counts.ContainsKey($type)) { $counts[$type]=0 }; $counts[$type]++
+    }
+    $table=New-Object byte[] ($hdr+$n*$stride); [Array]::Copy($Bytes,$conn,$table,0,$table.Length)
+    Write-EvidenceBlob -Name "NvidiaDCB:$InstanceId" -Bytes $table
+    $text=(@(foreach ($type in ($counts.Keys | Sort-Object)) { '{0} x{1}' -f $type,$counts[$type] }) -join ', ')
+    if ($unresolved -or $counts.Count -eq 0) { throw "NVIDIA DCB ambiguous or incomplete: $text" }
+    # Repeated identical registry reads are not independent boards. Conflicting
+    # caches for one adapter invalidate the candidate for the entire run.
+    $identity=[BitConverter]::ToString($table)
+    if ($script:DcbRejected.ContainsKey($InstanceId)) { return }
+    if ($script:DcbIdentities.ContainsKey($InstanceId) -and $script:DcbIdentities[$InstanceId] -cne $identity) {
+        $script:DcbRejected[$InstanceId]=$true
+        $script:DcbCandidates.Remove($InstanceId)
+        throw 'Conflicting cached connector tables for one NVIDIA adapter.'
+    }
+    $script:DcbIdentities[$InstanceId]=$identity
+    $script:DcbCandidates[$InstanceId]=$counts.Clone()
+    Write-Log INFO "NVIDIA DCB board candidate: Adapter=$InstanceId; $text; cached firmware not independently verified."
+}
+function Inspect-AcpiTable {
+    param([byte[]]$Bytes,[string]$Source)
+    if ($Bytes.Length -lt 36 -or $Bytes.Length -gt 2097152) { return }
+    $sig=[Text.Encoding]::ASCII.GetString($Bytes,0,4)
+    if ($sig -notin @('DSDT','SSDT') -or [BitConverter]::ToUInt32($Bytes,4) -ne $Bytes.Length) { return }
+    $ascii=[Text.Encoding]::ASCII.GetString($Bytes)
+    $hits=@(foreach ($token in @('_DOD','_DOS','_ADR','_DCS','_DGS','_DSS','GFX0','IGPU','PEGP','VGA_','CRT_')) { $n=[regex]::Matches($ascii,[regex]::Escape($token)).Count; if ($n -gt 0) { "$token=$n" } })
+    $sum=0; foreach ($b in $Bytes) { $sum=($sum+[int]$b) -band 255 }
+    Write-Log INFO "ACPI AML Source=$Source; Signature=$sig; Bytes=$($Bytes.Length); ChecksumRemainder=$sum; Tokens=$($hits -join ','); names are not evaluated devices."
+    if ($ascii -match '_DOD|_DOS|GFX0|IGPU|PEGP|VGA_|CRT_') { Write-EvidenceBlob -Name "ACPI:$Source" -Bytes $Bytes }
+    Read-IntelVbtEvidence -Bytes $Bytes -Source "ACPI:$Source"
+}
+function Read-AcpiEvidence {
+    if (-not ('MME.VideoInventory.FirmwareRead' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace MME.VideoInventory {
+    public static class FirmwareRead {
+        [DllImport("kernel32.dll", SetLastError=true)]
+        public static extern uint EnumSystemFirmwareTables(uint provider, [Out] byte[] buffer, uint size);
+        [DllImport("kernel32.dll", SetLastError=true)]
+        public static extern uint GetSystemFirmwareTable(uint provider, uint id, [Out] byte[] buffer, uint size);
+    }
+}
+'@
+    }
+    $provider=[uint32]0x41435049
+    $n=[MME.VideoInventory.FirmwareRead]::EnumSystemFirmwareTables($provider,$null,0)
+    if ($n -eq 0 -or $n -gt 65536 -or $n%4 -ne 0) { throw "Invalid ACPI enumeration size $n" }
+    $ids=New-Object byte[] $n
+    if ([MME.VideoInventory.FirmwareRead]::EnumSystemFirmwareTables($provider,$ids,$n) -ne $n) { throw 'ACPI enumeration failed or changed.' }
+    $sigs=@(for ($i=0;$i -lt $n;$i+=4) { [Text.Encoding]::ASCII.GetString($ids,$i,4) })
+    Write-Log INFO "ACPI signatures: $($sigs -join ',')"
+    foreach ($sig in @('DSDT','SSDT')) {
+        $occ=@($sigs | Where-Object { $_ -eq $sig }).Count
+        if ($occ -eq 0) { Write-Log WARN "ACPI $sig absent from API enumeration; attempting direct read." }
+        if ($occ -gt 1) { Write-Log WARN "ACPI $sig occurrences=$occ; API returns first only." }
+        try {
+            $id=[BitConverter]::ToUInt32([Text.Encoding]::ASCII.GetBytes($sig),0)
+            $size=[MME.VideoInventory.FirmwareRead]::GetSystemFirmwareTable($provider,$id,$null,0)
+            if ($size -lt 36 -or $size -gt 2097152) { throw "Invalid table size $size" }
+            $bytes=New-Object byte[] $size
+            if ([MME.VideoInventory.FirmwareRead]::GetSystemFirmwareTable($provider,$id,$bytes,$size) -ne $size) { throw 'ACPI table read failed or changed size.' }
+            Inspect-AcpiTable -Bytes $bytes -Source "API:$sig"
+        } catch { Write-Log WARN "ACPI $sig unavailable: $($_.Exception.Message)" }
+    }
+}
+function Invoke-BoardDiagnostics {
+    $script:EvidenceHashes=@{}; $script:EvidenceChars=0; $script:DcbCandidates=@{}; $script:DcbIdentities=@{}; $script:DcbRejected=@{}; $script:VbtFound=0
+    Write-Log INFO 'Board diagnostic start; no settings or custom-field changes.'
+    try { Read-AcpiEvidence } catch { Write-Log WARN "ACPI API unavailable: $($_.Exception.Message)" }
+    foreach ($name in @('DSDT','SSDT')) {
+        try {
+            $root="HKLM:\HARDWARE\ACPI\$name"
+            if (-not (Test-Path -LiteralPath $root)) { Write-Log INFO "ACPI registry $name absent."; continue }
+            $keys=@(Get-Item -LiteralPath $root; Get-ChildItem -LiteralPath $root -Recurse | Select-Object -First 128)
+            foreach ($key in $keys) { foreach ($v in $key.GetValueNames()) {
+                if ($key.GetValueKind($v) -eq [Microsoft.Win32.RegistryValueKind]::Binary) { Inspect-AcpiTable -Bytes ($key.GetValue($v)) -Source "Registry:$($key.Name):$v" }
+            } }
+        } catch { Write-Log WARN "ACPI registry $name unavailable: $($_.Exception.Message)" }
+    }
+    try { foreach ($r in @(Get-CimInstance -ClassName Win32_PortConnector)) { Write-Log INFO "SMBIOS WMI record External=$($r.ExternalReferenceDesignator); Internal=$($r.InternalReferenceDesignator); PortType=$($r.PortType); ConnectorType=$($r.ConnectorType -join ',')" } } catch { Write-Log WARN "Full firmware inventory unavailable: $($_.Exception.Message)" }
+    try { $devices=@(Get-PnpDevice -Class Display -PresentOnly) } catch { Write-Log WARN "Board PnP unavailable: $($_.Exception.Message)"; return }
+    foreach ($device in $devices) {
+        $instance=[string]$device.InstanceId
+        if ($instance -notmatch '(?i)^PCI\\VEN_(8086|10DE)&') { continue }; $vendor=$Matches[1].ToUpperInvariant()
+        try {
+            $driver=[string](Get-PnpDeviceProperty -InstanceId $instance -KeyName 'DEVPKEY_Device_Driver').Data
+            if ($driver -notmatch '^\{4d36e968-e325-11ce-bfc1-08002be10318\}\\\d{4}$') { throw "Unexpected driver key $driver" }
+            $root="HKLM:\SYSTEM\CurrentControlSet\Control\Class\$driver"
+            Write-Log INFO "Board driver key Adapter=$instance; Vendor=$vendor; Key=$driver"
+            $keys=@(Get-Item -LiteralPath $root; Get-ChildItem -LiteralPath $root -Recurse | Select-Object -First 128)
+            $binaryCount=0; $scanned=0; $before=$script:VbtFound
+            foreach ($key in $keys) {
+                foreach ($v in $key.GetValueNames()) {
+                    if ($key.GetValueKind($v) -ne [Microsoft.Win32.RegistryValueKind]::Binary) { continue }; $binaryCount++
+                    if ($vendor -eq '10DE' -and ($key.Name -notmatch '(?i)\\Session$' -or $v -ine 'vbios')) { continue }
+                    $bytes=$key.GetValue($v)
+                    if ($bytes -isnot [byte[]] -or $bytes.Length -lt 48 -or $bytes.Length -gt 4194304) { continue }
+                    if ($scanned+$bytes.Length -gt 16777216) { Write-Log WARN 'Driver registry scan budget reached.'; continue }; $scanned+=$bytes.Length
+                    $source="$($key.Name):$v"
+                    if ($vendor -eq '8086') { Read-IntelVbtEvidence -Bytes $bytes -Source $source }
+                    else { try { Read-NvidiaDcbEvidence -Bytes $bytes -Source $source -InstanceId $instance } catch { $script:DcbRejected[$instance]=$true; $script:DcbCandidates.Remove($instance); Write-Log WARN "NVIDIA DCB unavailable: $($_.Exception.Message)" } }
+                }
+            }
+            Write-Log INFO "Board driver scan complete: Adapter=$instance; BinaryValues=$binaryCount; ScannedBytes=$scanned"
+            if ($vendor -eq '8086' -and $script:VbtFound -eq $before) { Write-Log WARN "Intel driver registry VBT not recovered: $instance" }
+            if ($vendor -eq '10DE' -and -not $script:DcbCandidates.ContainsKey($instance)) { Write-Log WARN "NVIDIA Session VBIOS DCB candidate unavailable: $instance" }
+        } catch { Write-Log WARN "Board driver evidence unavailable: Adapter=$instance; $($_.Exception.Message)" }
+    }
+    Write-Log INFO "Board diagnostic end; VBTMatches=$script:VbtFound; DCBAdapters=$($script:DcbCandidates.Count); EvidenceEncodedChars=$script:EvidenceChars"
+}
+
 try {
     $null = New-Item -ItemType Directory -Path (Split-Path -Parent $LogFile) -Force
     Write-Log INFO "Start Build=$ScriptBuild Device=$env:COMPUTERNAME"
@@ -115,6 +342,7 @@ try {
             }) -join ', ')
         }
     }
+    try { Invoke-BoardDiagnostics } catch { Write-Log WARN "Board diagnostic incomplete: $($_.Exception.Message)" }
     # Physical inventory is a separate, best-effort operation. Never use
     # unqualified logical driver target counts as physical socket counts.
     $availableSummary = 'N/A'
@@ -126,12 +354,14 @@ try {
         if ($adapters.Count -eq 0 -or $present.Count -eq 0) { throw 'No display adapter inventory.' }
         $presentIds = @($present | ForEach-Object { [string]$_.InstanceId } | Sort-Object -Unique)
         $controllerIds = @($adapters | ForEach-Object { [string]$_.PNPDeviceID } | Sort-Object -Unique)
-        if (@(Compare-Object $presentIds $controllerIds).Count -ne 0) { throw 'PnP and video-controller inventories differ.' }
+        $adapterInventoryMismatch = @(Compare-Object $presentIds $controllerIds).Count -ne 0
+        if ($adapterInventoryMismatch) { Write-Log WARN 'PnP and video-controller inventories differ; present PnP sources will be evaluated.' }
         $onboard = @()
         $cards = @()
         $nvidiaCards = @()
-        $inventoryPartial = $false
+        $inventoryPartial = $adapterInventoryMismatch
         $nvidiaTypes = @{}
+        $physicalByAdapter = @{}
         foreach ($adapter in $present) {
             $id = [string]$adapter.InstanceId
             try {
@@ -195,7 +425,9 @@ try {
             # Firmware provides no explicit owner for generic port labels. On the
             # supported conventional desktop topology we treat these as board
             # connectors; do not claim independently certified completeness.
-            Write-Log INFO 'Motherboard source=SMBIOS Type 8; generic firmware labels assumed to describe motherboard connectors on supported desktop topology.'
+            $motherboardId = [string]$onboard[0].InstanceId
+            $physicalByAdapter[$motherboardId] = $physical.Clone()
+            Write-Log INFO 'Motherboard source=SMBIOS Type 8; generic firmware labels assumed to describe motherboard connectors on supported desktop topology. Optional or unlisted sockets cannot be ruled out.'
         } catch {
             $physical.Clear()
             $inventoryPartial = $true
@@ -325,168 +557,50 @@ namespace MME.VideoInventory {
                     if (-not $physical.ContainsKey($type)) { $physical[$type] = 0 }
                     $physical[$type] += $cardCounts[$type]
                 }
+                $physicalByAdapter[[string]$card.Id] = $cardCounts.Clone()
             } catch {
                 $inventoryPartial = $true
                 Write-Log WARN "AMD adapter inventory incomplete: $($card.Id); $($_.Exception.Message)"
             }
         }
-        # NVIDIA NVAPI: driver-reported possible outputs, not certified sockets.
-        # Use documented display IDs, discard dynamic MST sinks, and collapse
-        # identical GPU output IDs when the driver exposes that mapping.
+        # NVIDIA: use only an adapter-bound, validated DCB connector table.
+        # Neither display IDs nor GPU output bitmasks prove physical sockets.
         foreach ($card in $nvidiaCards) {
             try {
-                if (-not [Environment]::Is64BitProcess) { throw 'NVIDIA query requires 64-bit PowerShell.' }
-                $dll = Join-Path ([Environment]::SystemDirectory) 'nvapi64.dll'
-                if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { throw 'Installed NVIDIA NVAPI library is unavailable.' }
-                $sig = Get-AuthenticodeSignature -LiteralPath $dll
-                if ($sig.Status -ne 'Valid') { throw "NVIDIA driver library signature not valid: $($sig.Status)" }
-                if (-not ('MME.VideoInventory.NvApi' -as [type])) {
-                    Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-namespace MME.VideoInventory {
-  public static class NvApi {
-    [DllImport("nvapi64.dll", EntryPoint="nvapi_QueryInterface", CallingConvention=CallingConvention.Cdecl)]
-    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-    private static extern IntPtr Query(uint id);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int Simple();
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int EnumGpu([Out, MarshalAs(UnmanagedType.LPArray, SizeConst=64)] IntPtr[] handles, out uint count);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GetBus(IntPtr gpu, out uint bus);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GetPci(IntPtr gpu, out uint device, out uint subsystem, out uint revision, out uint extended);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GetIds(IntPtr gpu, IntPtr data, ref uint count);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int MapId(uint displayId, out IntPtr gpu, out uint output);
-    private static T Bind<T>(uint id) where T: class {
-      IntPtr p=Query(id);
-      if(p==IntPtr.Zero) throw new InvalidOperationException("NVAPI interface missing: "+id.ToString("X8"));
-      return Marshal.GetDelegateForFunctionPointer(p,typeof(T)) as T;
-    }
-    private static void Check(int rc,string stage) { if(rc!=0) throw new InvalidOperationException(stage+" returned NVAPI status "+rc); }
-    public struct Output {
-      public uint DisplayId, Flags, OutputId;
-      public int ConnectorType, MapStatus;
-    }
-    public static Output[] Read(uint bus,uint pci,uint subsystem) {
-      var init=Bind<Simple>(0x0150e828); var unload=Bind<Simple>(0xd22bdd7e);
-      Check(init(),"NVAPI initialize");
-      try {
-        var enumerate=Bind<EnumGpu>(0xe5ac921f);
-        var getBus=Bind<GetBus>(0x1be0b8e5); var getPci=Bind<GetPci>(0x2ddfb66e);
-        var getIds=Bind<GetIds>(0x785210a2);
-        MapId map=null; try { map=Bind<MapId>(0x112ba1a5); } catch(InvalidOperationException) {}
-        IntPtr[] handles=new IntPtr[64]; uint count;
-        Check(enumerate(handles,out count),"NVAPI enumerate GPUs");
-        if(count==0 || count>64) throw new InvalidOperationException("Invalid NVAPI GPU count");
-        var matches=new HashSet<IntPtr>();
-        for(int i=0;i<(int)count;i++) {
-          uint b,d,s,r,e;
-          Check(getBus(handles[i],out b),"NVAPI PCI bus");
-          Check(getPci(handles[i],out d,out s,out r,out e),"NVAPI PCI identifiers");
-          if(b==bus && d==pci && s==subsystem) matches.Add(handles[i]);
-        }
-        if(matches.Count!=1) throw new InvalidOperationException("NVIDIA PCI identity not uniquely matched");
-        IntPtr gpu=IntPtr.Zero; foreach(IntPtr h in matches) gpu=h;
-        uint n=0; Check(getIds(gpu,IntPtr.Zero,ref n),"NVAPI output count");
-        if(n==0 || n>1024) throw new InvalidOperationException("Invalid NVAPI display ID count");
-        const int stride=16; const int version=0x00030010; // NV_GPU_DISPLAYIDS_VER2 (version number 3)
-        int capacity=(int)n; IntPtr data=Marshal.AllocHGlobal(capacity*stride);
-        try {
-          Marshal.Copy(new byte[capacity*stride],0,data,capacity*stride);
-          for(int i=0;i<capacity;i++) Marshal.WriteInt32(data,i*stride,version);
-          Check(getIds(gpu,data,ref n),"NVAPI all display IDs");
-          if(n==0 || n>(uint)capacity) throw new InvalidOperationException("Invalid returned NVAPI display ID count");
-          var result=new List<Output>();
-          for(int i=0;i<(int)n;i++) {
-            int off=i*stride;
-            Output o=new Output();
-            o.ConnectorType=Marshal.ReadInt32(data,off+4);
-            o.DisplayId=unchecked((uint)Marshal.ReadInt32(data,off+8));
-            o.Flags=unchecked((uint)Marshal.ReadInt32(data,off+12));
-            o.MapStatus=-1;
-            if(map!=null && (o.Flags&1)==0) {
-              IntPtr owner; uint output;
-              o.MapStatus=map(o.DisplayId,out owner,out output);
-              if(o.MapStatus==0 && owner==gpu && output!=0 && (output&(output-1))==0) o.OutputId=output;
-              else if(o.MapStatus==0) o.MapStatus=-1;
-            }
-            result.Add(o);
-          }
-          return result.ToArray();
-        } finally { Marshal.FreeHGlobal(data); }
-      } finally { Check(unload(),"NVAPI unload"); }
-    }
-  }
-}
-'@
+                $adapterId=[string]$card.Id
+                if (-not $script:DcbCandidates.ContainsKey($adapterId) -or $script:DcbRejected.ContainsKey($adapterId)) {
+                    throw 'No usable adapter-bound VBIOS connector table; logical output counts excluded.'
                 }
-                $outputs = @([MME.VideoInventory.NvApi]::Read($card.Bus,$card.PciId,$card.Subsystem))
-                $groups = @{}
-                $staticOutputs = @()
-                foreach ($output in $outputs) {
-                    Write-Log INFO "NVIDIA output PCI=$($card.Bus):$($card.Device):$($card.Function); DisplayId=$($output.DisplayId); Code=$($output.ConnectorType); Flags=$($output.Flags); OutputId=$($output.OutputId); MapStatus=$($output.MapStatus)"
-                    if (($output.Flags -band 1) -ne 0) { continue } # MST downstream logical sink
-                    $staticOutputs += $output
-                }
-                if ($staticOutputs.Count -eq 0) { throw 'No non-dynamic NVIDIA outputs.' }
-                $mapped = @($staticOutputs | Where-Object { $_.OutputId -ne 0 }).Count
-                if ($mapped -eq 0) {
-                    $inventoryPartial = $true
-                    Write-Log WARN 'NVIDIA output mapping unavailable; distinct non-dynamic display IDs used as inferred counts.'
-                }
-                foreach ($output in $staticOutputs) {
-                    # Avoid mixing mapped and unmapped keys: an unmapped ID may
-                    # be a second representation of a mapped output.
-                    if ($mapped -gt 0 -and $output.OutputId -eq 0) {
-                        $inventoryPartial = $true
-                        Write-Log WARN "NVIDIA unmapped display ID omitted: $($output.DisplayId)"
-                        continue
-                    }
-                    $key = if ($mapped -gt 0) { "Output:$($output.OutputId)" } else { "Display:$($output.DisplayId)" }
-                    $type = switch ([int]$output.ConnectorType) {
-                        1 { 'VGA' } 2 { 'Component' } 3 { 'S-Video' } 4 { 'HDMI' }
-                        5 { 'DVI' } 7 { 'DP' } 8 { 'Composite' } default { '' }
-                    }
-                    if (-not $groups.ContainsKey($key)) { $groups[$key] = @() }
-                    $groups[$key] += $type
-                }
-                $cardCounts = @{}
-                foreach ($key in $groups.Keys) {
-                    $types = @($groups[$key] | Sort-Object -Unique)
-                    if ($types.Count -ne 1 -or [string]::IsNullOrEmpty($types[0])) {
-                        $inventoryPartial = $true
-                        Write-Log WARN "NVIDIA ambiguous connector omitted: $key; Types=$($types -join ',')"
-                        continue
-                    }
-                    $type = $types[0]
-                    if (-not $cardCounts.ContainsKey($type)) { $cardCounts[$type] = 0 }
-                    $cardCounts[$type]++
-                }
-                if ($cardCounts.Count -eq 0) { throw 'No classifiable NVIDIA outputs.' }
+                $cardCounts=$script:DcbCandidates[$adapterId]
                 foreach ($type in $cardCounts.Keys) {
                     if (-not $physical.ContainsKey($type)) { $physical[$type] = 0 }
                     $physical[$type] += $cardCounts[$type]
                     $nvidiaTypes[$type] = $true
                 }
-                Write-Log WARN "NVIDIA inferred output inventory; PCI=$($card.Bus):$($card.Device):$($card.Function); Mapped=$mapped; Static=$($staticOutputs.Count); socket count not independently verified."
+                $physicalByAdapter[$adapterId]=$cardCounts.Clone()
+                Write-Log INFO "NVIDIA board inventory source=VBIOS DCB; Adapter=$adapterId; no logical outputs counted."
             } catch {
-                $inventoryPartial = $true
+                $inventoryPartial=$true
                 Write-Log WARN "NVIDIA adapter inventory incomplete: $($card.Id); $($_.Exception.Message)"
             }
         }
         if ($physical.Count -eq 0) { throw 'No usable motherboard or graphics-card connector inventory.' }
-        # Preserve baseline VGA count before supplemental VGA heuristic.
-        $baselineVgaCount = 0
-        if ($physical.ContainsKey('VGA')) { $baselineVgaCount = [int]$physical['VGA'] }
-        $vgaQualifier = ''
-        # Supplemental VGA heuristic approved for the v8 pilot. This is the
-        # same Windows target-name query tested in Ninja Background PowerShell.
-        # Logical VGA targets may represent compatibility modes, not sockets.
-        # Add at most one VGA system-wide, only if baseline sources found none.
-        if (-not $physical.ContainsKey('VGA')) {
-            $manager = $null
-            try {
-                if (-not ('MME.VideoInventory.PortProbe' -as [type])) {
-                    Add-Type -Language CSharp -TypeDefinition @'
+        # Cross-validation only. Neither connected nor disconnected logical
+        # targets can establish additional physical sockets. GET_TARGET_BASE_TYPE
+        # (6) returns a 24-byte structure (20-byte header; technology at 20).
+        $qualifiers = @{}
+        foreach ($type in $nvidiaTypes.Keys) { $qualifiers[$type] = 'DCB' }
+        $reviewTypes = @{}
+        $validationIncomplete = $false
+        $comparisonReliable = $true
+        $connectedTypes = @{}
+        $baseByAdapter = @{}
+        $convertedTypes = @{}
+        $seenTargets = @{}
+        $manager = $null
+        try {
+            if (-not ('MME.VideoInventory.PortProbe' -as [type])) {
+                Add-Type -Language CSharp -TypeDefinition @'
 using System.Runtime.InteropServices;
 namespace MME.VideoInventory {
     public static class PortProbe {
@@ -496,83 +610,124 @@ namespace MME.VideoInventory {
     }
 }
 '@
+            }
+            $manager = [Windows.Devices.Display.Core.DisplayManager,Windows.Devices.Display.Core,ContentType=WindowsRuntime]::Create(0)
+            $targets = @($manager.GetCurrentTargets())
+            if ($targets.Count -eq 0 -and $active.Count -gt 0) { throw 'No display targets returned for active monitors.' }
+            foreach ($target in $targets) {
+                $adapter = [string]$target.Adapter.DeviceInterfacePath
+                $targetId = [uint32]$target.AdapterRelativeId
+                $connected = [bool]$target.IsConnected
+                if ($target.IsStale) {
+                    if ($connected) { $comparisonReliable = $false; $validationIncomplete = $true }
+                    Write-Log WARN "Validation skipped stale target Adapter=$adapter; Target=$targetId; Connected=$connected"
+                    continue
                 }
-                $manager = [Windows.Devices.Display.Core.DisplayManager,Windows.Devices.Display.Core,ContentType=WindowsRuntime]::Create(0)
-                $vgaCandidates = @{}
-                $targets = @($manager.GetCurrentTargets())
-                if ($targets.Count -eq 0) { throw 'No display targets returned.' }
-                foreach ($target in $targets) {
-                    $adapter = [string]$target.Adapter.DeviceInterfacePath
-                    $targetId = [uint32]$target.AdapterRelativeId
-                    $connected = $target.IsConnected
-                    if ($target.IsStale) {
-                        Write-Log WARN "VGA probe skipped stale target Adapter=$adapter; Target=$targetId"
-                        continue
-                    }
-                    $id = $target.Adapter.Id
-                    # DISPLAYCONFIG_TARGET_DEVICE_NAME: 420 bytes; header type
-                    # 2 = GET_TARGET_NAME; outputTechnology at 24, connectorInstance at 32.
-                    $buffer = New-Object byte[] 420
-                    [BitConverter]::GetBytes([uint32]2).CopyTo($buffer, 0)
-                    [BitConverter]::GetBytes([uint32]420).CopyTo($buffer, 4)
-                    [BitConverter]::GetBytes([uint32]$id.LowPart).CopyTo($buffer, 8)
-                    [BitConverter]::GetBytes([int32]$id.HighPart).CopyTo($buffer, 12)
-                    [BitConverter]::GetBytes($targetId).CopyTo($buffer, 16)
-                    $rc = [MME.VideoInventory.PortProbe]::DisplayConfigGetDeviceInfo($buffer)
-                    if ($rc -ne 0) {
-                        Write-Log WARN "VGA probe Adapter=$adapter; Target=$targetId; Return=$rc"
-                        continue
-                    }
-                    $technology = [BitConverter]::ToInt32($buffer, 24)
-                    $instance = [BitConverter]::ToUInt32($buffer, 32)
-                    Write-Log INFO "VGA probe Adapter=$adapter; Target=$targetId; Connected=$connected; Return=$rc; Type=$technology; Connector=$instance"
-                    if ($technology -eq 0) {
-                        $key = '{0}:{1}:{2}' -f $id.HighPart, $id.LowPart, $targetId
-                        $vgaCandidates[$key] = $true
-                    }
+                $id = $target.Adapter.Id
+                $key = '{0}:{1}:{2}' -f $id.HighPart, $id.LowPart, $targetId
+                if ($seenTargets.ContainsKey($key)) { continue }
+                $seenTargets[$key] = $true
+                # DISPLAYCONFIG_TARGET_DEVICE_NAME (2), 420 bytes.
+                $buffer = New-Object byte[] 420
+                [BitConverter]::GetBytes([uint32]2).CopyTo($buffer, 0)
+                [BitConverter]::GetBytes([uint32]420).CopyTo($buffer, 4)
+                [BitConverter]::GetBytes([uint32]$id.LowPart).CopyTo($buffer, 8)
+                [BitConverter]::GetBytes([int32]$id.HighPart).CopyTo($buffer, 12)
+                [BitConverter]::GetBytes($targetId).CopyTo($buffer, 16)
+                $rc = [MME.VideoInventory.PortProbe]::DisplayConfigGetDeviceInfo($buffer)
+                if ($rc -ne 0) {
+                    if ($connected) { $comparisonReliable = $false; $validationIncomplete = $true }
+                    Write-Log WARN "Target validation Adapter=$adapter; Target=$targetId; Connected=$connected; Return=$rc"
+                    continue
                 }
-                if ($vgaCandidates.Count -gt 0) {
-                    $physical['VGA'] = 1
-                    $vgaQualifier = 'Inferred'
-                    Write-Log WARN "Supplemental VGA inferred=1; LogicalCandidates=$($vgaCandidates.Count); physical socket not independently verified."
-                } else {
-                    Write-Log INFO 'Supplemental VGA probe found no VGA target; baseline inventory retained.'
+                $technology = [BitConverter]::ToUInt32($buffer, 24)
+                $instance = [BitConverter]::ToUInt32($buffer, 32)
+                $reportedType = Get-DisplayType -Code $technology
+                $baseBuffer = New-Object byte[] 24
+                [Array]::Copy($buffer,0,$baseBuffer,0,20)
+                [BitConverter]::GetBytes([uint32]6).CopyTo($baseBuffer, 0)
+                [BitConverter]::GetBytes([uint32]24).CopyTo($baseBuffer, 4)
+                $baseRc = [MME.VideoInventory.PortProbe]::DisplayConfigGetDeviceInfo($baseBuffer)
+                $baseType = 'Unknown'
+                if ($baseRc -eq 0) { $baseType = Get-DisplayType -Code ([BitConverter]::ToUInt32($baseBuffer, 20)) }
+                Write-Log INFO "Target validation Adapter=$adapter; Target=$targetId; Connected=$connected; Type=$reportedType; Code=$technology; Connector=$instance; BaseType=$baseType; BaseReturn=$baseRc"
+                if (-not $connected) {
+                    if ($reportedType -eq 'VGA' -or $baseType -eq 'VGA') {
+                        Write-Log INFO 'Disconnected logical VGA observed; no physical socket added.'
+                    }
+                    continue
                 }
-            } catch {
-                Write-Log WARN "Supplemental VGA probe unavailable; baseline inventory retained: $($_.Exception.Message)"
-            } finally {
-                if ($manager -is [IDisposable]) {
-                    try { $manager.Dispose() } catch { Write-Log WARN "VGA probe cleanup: $($_.Exception.Message)" }
+                if (-not $connectedTypes.ContainsKey($reportedType)) { $connectedTypes[$reportedType] = 0 }
+                $connectedTypes[$reportedType]++
+                # Match interface path to the PnP instance ID, not just vendor ID.
+                $pnpId = ''
+                if ($adapter -match '(?i)PCI#([^#]+)#([^#]+)#') { $pnpId = 'PCI\{0}\{1}' -f $Matches[1],$Matches[2] }
+                if ($baseRc -ne 0 -or $baseType -in @('Unknown','Other video') -or -not $physicalByAdapter.ContainsKey($pnpId)) {
+                    $comparisonReliable = $false
+                    $validationIncomplete = $true
+                    Write-Log WARN "Connected target base/adapter evidence incomplete: Adapter=$adapter; Target=$targetId; Type=$reportedType; BaseType=$baseType"
+                    continue
+                }
+                if (-not $baseByAdapter.ContainsKey($pnpId)) { $baseByAdapter[$pnpId] = @{} }
+                $baseCounts = $baseByAdapter[$pnpId]
+                if (-not $baseCounts.ContainsKey($baseType)) { $baseCounts[$baseType] = 0 }
+                $baseCounts[$baseType]++
+                if ($reportedType -ne $baseType) {
+                    if (-not $convertedTypes.ContainsKey($reportedType)) { $convertedTypes[$reportedType] = 0 }
+                    $convertedTypes[$reportedType]++
+                    Write-Log INFO "Possible output conversion: Adapter=$pnpId; Target=$targetId; Reported=$reportedType; Base=$baseType; not proof of physical socket mapping."
                 }
             }
-        } else {
-            Write-Log INFO 'Supplemental VGA probe skipped; VGA already present in baseline inventory.'
+        } catch {
+            $comparisonReliable = $false
+            $validationIncomplete = $true
+            Write-Log WARN "Target cross-validation unavailable; baseline inventory retained: $($_.Exception.Message)"
+        } finally {
+            if ($manager -is [IDisposable]) {
+                try { $manager.Dispose() } catch { Write-Log WARN "Target validation cleanup: $($_.Exception.Message)" }
+            }
         }
-        # Reconcile all identifiable physical video connector types, not
-        # just VGA. Active connections can use adapters or MST; reported
-        # unverified counts are connection evidence, not additional sockets.
-        if (-not $displayReadOk) { throw 'Active display data unavailable for reconciliation.' }
-        $qualifiers = @{}
-        foreach ($type in $nvidiaTypes.Keys) { $qualifiers[$type] = 'Inferred' }
-        if ($vgaQualifier -ne '') { $qualifiers['VGA'] = $vgaQualifier }
-        $physicalTypes = @('VGA','DP','DVI','HDMI','USB-C','S-Video','Composite','Component','D-JPN','SDI','UDI')
+        # Check aggregate connected target observations against the unchanged
+        # WMI inventory. Connected targets need not all be active monitors.
+        if (-not $displayReadOk) {
+            $comparisonReliable = $false
+            $validationIncomplete = $true
+            Write-Log WARN 'Active inventory unavailable for comparison; physical baseline retained.'
+        } else {
+            foreach ($type in (@($active.Keys) + @($connectedTypes.Keys) | Sort-Object -Unique)) {
+                $a = [int]$active[$type]
+                $c = [int]$connectedTypes[$type]
+                if ($a -ne $c) {
+                    $comparisonReliable = $false
+                    $validationIncomplete = $true
+                    Write-Log WARN "WMI/connected target discrepancy: Type=$type; Active=$a; ConnectedTargets=$c"
+                }
+            }
+        }
+        # Check underlying connected types per adapter without assigning any
+        # logical target to an individual physical socket (MST may share one).
+        foreach ($pnpId in $baseByAdapter.Keys) {
+            foreach ($type in $baseByAdapter[$pnpId].Keys) {
+                $count = [int]$baseByAdapter[$pnpId][$type]
+                $baseline = [int]$physicalByAdapter[$pnpId][$type]
+                if ($count -gt $baseline) {
+                    $comparisonReliable = $false
+                    $reviewTypes[$type] = $true
+                    Write-Log WARN "Adapter base discrepancy: Adapter=$pnpId; Type=$type; ConnectedBaseTargets=$count; PhysicalBaseline=$baseline; no socket added."
+                }
+            }
+        }
         foreach ($type in ($active.Keys | Sort-Object)) {
-            $baselineCount = 0
-            if ($type -eq 'VGA') {
-                # Active VGA evidence supersedes the earlier logical inference.
-                $baselineCount = $baselineVgaCount
-            } elseif ($physical.ContainsKey($type)) {
-                $baselineCount = [int]$physical[$type]
+            $baselineCount = [int]$physical[$type]
+            $activeCount = [int]$active[$type]
+            if ($activeCount -le $baselineCount) { continue }
+            $gap = $activeCount - $baselineCount
+            if ($comparisonReliable -and -not $inventoryPartial -and [int]$convertedTypes[$type] -ge $gap) {
+                Write-Log INFO "Connector discrepancy consistent with output conversion: Type=$type; Active=$activeCount; PhysicalBaseline=$baselineCount; no socket added."
+            } else {
+                $reviewTypes[$type] = $true
+                Write-Log WARN "Unresolved connector discrepancy: Type=$type; Active=$activeCount; PhysicalBaseline=$baselineCount; no socket added."
             }
-            if ([int]$active[$type] -le $baselineCount) { continue }
-            if ($type -notin $physicalTypes) {
-                # Do not invent physical sockets for virtual, wireless,
-                # internal or otherwise unmapped display technologies.
-                throw "Active display technology cannot be mapped to a physical connector: $type"
-            }
-            $physical[$type] = [int]$active[$type]
-            $qualifiers[$type] = 'Unverified'
-            Write-Log WARN "Connector discrepancy: Type=$type; PhysicalBaseline=$baselineCount; ActiveDisplays=$($active[$type]); ReportedCount=$($physical[$type]); physical socket count unverified; may overlap other connector types."
         }
         $availableSummary = (@(foreach ($type in ($physical.Keys | Sort-Object)) {
             $entry = '{0} x{1}' -f $type, $physical[$type]
@@ -580,6 +735,11 @@ namespace MME.VideoInventory {
             $entry
         }) -join ', ')
         if ($inventoryPartial) { $availableSummary += ' (Partial)' }
+        if ($reviewTypes.Count -gt 0) {
+            $availableSummary += ' (Check: ' + (($reviewTypes.Keys | Sort-Object) -join ', ') + ')'
+        } elseif ($validationIncomplete) {
+            $availableSummary += ' (Check)'
+        }
         Write-Log INFO "Available inventory (firmware + local GPU driver evidence; qualifiers indicate uncertainty): $availableSummary"
     } catch {
         $availableSummary = 'N/A'
@@ -588,7 +748,7 @@ namespace MME.VideoInventory {
 
     $separator = '; '
     if ($UseMultilineField) { $separator = "`n" }
-    $value = "Active Ports: $activeSummary${separator}Available Ports: $availableSummary"
+    $value = "Active Ports: $activeSummary${separator}Available Ports: $availableSummary${separator}$Disclaimer"
     Write-Log INFO "Inventory: $value"
     foreach ($issue in ($issues | Sort-Object -Unique)) { Write-Log WARN $issue }
     if ($script:LogFailed) { throw 'Required logging failed before field update.' }
@@ -615,8 +775,9 @@ namespace MME.VideoInventory {
     Write-Log ERROR $_.Exception.Message
     $Final = 'ERROR | ' + (Safe-Text $_.Exception.Message)
 } finally {
+    if (-not $Final.EndsWith($Disclaimer, [StringComparison]::Ordinal)) { $Final += "; $Disclaimer" }
     Write-Log INFO "Final: $Final"
-    if ($script:LogFailed) { $Final = 'ERROR | Required logging failed; see available log and verify field state.' }
+    if ($script:LogFailed) { $Final = "ERROR | Required logging failed; see available log and verify field state; $Disclaimer" }
     Write-Output $Final
 }
 exit 0
